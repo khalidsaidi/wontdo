@@ -1,0 +1,5 @@
+{
+  "name": "wontdo",
+  "version": "0.1.0",
+  "description": "Looks over the agent's shoulder and never lets it write documentation or unit tests."
+}
