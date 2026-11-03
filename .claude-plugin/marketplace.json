@@ -6,7 +6,7 @@
     {
       "name": "wontdo",
       "source": "./",
-      "description": "Looks over the agent's shoulder: won't doc, won't test."
+      "description": "Looks over the agent's shoulder: no docs, no unit tests, no CI, no PRs."
     }
   ]
 }

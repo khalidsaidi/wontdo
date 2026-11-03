@@ -1,6 +1,6 @@
 ---
 name: wontdo
-description: Show whether wontdo is on and what it has blocked. Wontdo stops agents writing documentation or unit tests.
+description: Show whether wontdo is on and what it has blocked. Wontdo stops agents writing docs, unit tests or CI, or touching PRs.
 disable-model-invocation: true
 ---
 

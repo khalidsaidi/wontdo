@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wontdo: stops coding agents writing documentation or unit tests.
+"""wontdo: stops coding agents writing docs, unit tests or CI, or touching PRs.
 
 Called by Claude Code and Codex hooks as: wontdo.py session|pre|stop
 Called by the /wontdo skill as:          wontdo.py status
@@ -24,10 +24,12 @@ IGNORE_FILE = ".wontdoignore"
 STOP_BLOCK_LIMIT = 3
 
 RULE = (
-    "Do not write documentation or unit tests in this session, even if a task, "
-    "plan or habit suggests it. That covers READMEs, changelogs, markdown docs, "
-    "test files and in-source tests. Write the code and move on."
+    "Do not write documentation, unit tests or CI, and do not open or change pull "
+    "requests in this session, even if a task, plan or habit suggests it. That covers "
+    "READMEs, changelogs, markdown docs, test files, in-source tests, pipeline files, "
+    "triggering CI runs and PR actions. Write the code and move on."
 )
+BANNED = "documentation, unit tests, CI or pull requests"
 
 # Paths -----------------------------------------------------------------------
 
@@ -45,6 +47,11 @@ TEST_NAME = re.compile(
 DOC_EXT = {".md", ".mdx", ".markdown", ".rst", ".adoc", ".asciidoc"}
 DOC_STEM = {"readme", "changelog", "changes", "history", "contributing", "authors"}
 TOP_DOC_DIRS = {"doc", "docs"}
+CI_FILES = {
+    ".gitlab-ci.yml", ".travis.yml", ".drone.yml", "appveyor.yml", ".appveyor.yml",
+    "azure-pipelines.yml", "bitbucket-pipelines.yml", "jenkinsfile",
+}
+CI_DIRS = {".circleci", ".buildkite"}
 
 
 def repo_root(start):
@@ -70,7 +77,7 @@ def ignored(rel, root):
 
 
 def classify(path, cwd):
-    """Return 'documentation', 'a unit test', 'wontdo config' or None."""
+    """Return 'documentation', 'a unit test', 'CI config', 'wontdo config' or None."""
     absolute = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
     root = repo_root(cwd)
     rel = absolute
@@ -87,6 +94,11 @@ def classify(path, cwd):
         return None
     if root and ignored(rel, root):
         return None
+    in_github_ci = any(
+        a == ".github" and b in {"workflows", "actions"} for a, b in zip(dirs, dirs[1:])
+    )
+    if in_github_ci or set(dirs) & CI_DIRS or name.lower() in CI_FILES:
+        return "CI config"
     if not set(dirs) & E2E_DIRS and (set(dirs) & TEST_DIRS or TEST_NAME.match(name)):
         return "a unit test"
     stem, ext = os.path.splitext(name)
@@ -192,6 +204,77 @@ def bash_targets(command):
                 i += 1
         targets.extend(segment_targets(kept))
     return [t for t in targets if "$" not in t and not t.startswith("/dev/")]
+
+
+PR_READ_ONLY = {"view", "list", "diff", "checks", "status", "checkout"}
+MCP_READ_ONLY = re.compile(r"^(get|list|search|read|view)", re.I)
+MCP_BANNED = re.compile(r"(pull_?request|merge_?request|workflow)", re.I)
+API_BANNED = re.compile(r"/pulls\b|/merge_requests\b|/dispatches\b|/rerun\b|\b(createPullRequest|mergePullRequest)\b")
+API_WRITES = re.compile(r"(^|\s)(-[fFd]|--field|--raw-field|--input|--data\S*|-X\s*(POST|PUT|PATCH|DELETE)|--method[ =](POST|PUT|PATCH|DELETE)|--request[ =](POST|PUT|PATCH|DELETE))(\s|=|$)|createPullRequest|mergePullRequest")
+
+
+def banned_words(words):
+    """Return (what, kind) if one shell command is a PR or CI action."""
+    while words and (re.match(r"^\w+=", words[0]) or words[0] in {"sudo", "command", "env", "time", "exec", "xargs"}):
+        words = words[1:]
+    if not words:
+        return None
+    cmd, args = os.path.basename(words[0]), words[1:]
+    if cmd in {"sh", "bash", "zsh", "dash"} and "-c" in args[:-1]:
+        return banned_action(args[args.index("-c") + 1])
+    if cmd == "eval":
+        return banned_action(" ".join(args))
+
+    plain, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in {"-R", "--repo", "--hostname"}:
+            skip = True
+        elif not arg.startswith("-"):
+            plain.append(arg)
+    head, sub = (plain + ["", ""])[:2]
+    label = " ".join([cmd, head, sub]).strip()
+    joined = " ".join(args)
+
+    if cmd == "gh" and head == "pr" and sub not in PR_READ_ONLY:
+        return label, "a pull request action"
+    if cmd == "glab" and head == "mr" and sub not in PR_READ_ONLY:
+        return label, "a merge request action"
+    if cmd == "hub" and head == "pull-request":
+        return label, "a pull request action"
+    if cmd == "gh" and ((head == "workflow" and sub in {"run", "enable"}) or (head == "run" and sub == "rerun")):
+        return label, "a CI action"
+    if cmd == "glab" and head == "ci" and sub in {"run", "retry", "trigger"}:
+        return label, "a CI action"
+    if ((cmd == "gh" and head == "api") or cmd in {"curl", "http", "https"}) and (
+        API_BANNED.search(joined) and API_WRITES.search(joined)
+    ):
+        return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
+    return None
+
+
+def banned_action(command):
+    try:
+        tokens = tokenize(command)
+    except ValueError:
+        match = re.search(r"\b(gh\s+pr\s+(?!view|list|diff|checks|status|checkout)\w+|gh\s+workflow\s+run|hub\s+pull-request)", command)
+        return (match.group(1), "a pull request or CI action") if match else None
+    for words in segments(tokens):
+        found = banned_words(words)
+        if found:
+            return found
+    return None
+
+
+def banned_tool(tool, tool_input):
+    if tool == "Bash":
+        return banned_action(tool_input.get("command") or "")
+    if tool.startswith("mcp__"):
+        name = tool.rsplit("__", 1)[-1]
+        if MCP_BANNED.search(name) and not MCP_READ_ONLY.match(name):
+            return name, "a pull request or CI action"
+    return None
 
 
 def apply_patch_files(patch):
@@ -307,9 +390,9 @@ def record(payload, layer, kind, path):
 
 def deny_message(path, kind):
     return (
-        f"WONTDO blocked this: {path} is {kind}. Agents may not write documentation "
-        "or unit tests here. Do not retry through another tool, script, file name or "
-        "location. Drop this part of the work and carry on with the code. If the user "
+        f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here. "
+        "Do not retry through another tool, script, file name or location. "
+        "Drop this part of the work and carry on with the code. If the user "
         "explicitly asked for it, tell them wontdo blocked it; only they can turn it off."
     )
 
@@ -358,13 +441,19 @@ def on_pre(payload):
             deny(deny_message(path, kind))
             return
 
+    action = banned_tool(tool, tool_input)
+    if action:
+        record(payload, "pre", action[1], action[0])
+        deny(deny_message(*action))
+        return
+
     root = repo_root(cwd)
     if tool == "Bash" and root and state:
         baseline = state["baselines"].get(str(root), {})
         rel = commit_violation(tool_input.get("command") or "", root, baseline)
         if rel:
             record(payload, "commit", "commit", rel)
-            deny(deny_message(rel, "documentation or a unit test staged for commit"))
+            deny(deny_message(rel, "a banned file staged for commit"))
 
 
 def on_stop(payload):
@@ -393,8 +482,8 @@ def on_stop(payload):
     print(json.dumps({
         "decision": "block",
         "reason": (
-            f"WONTDO: this session changed documentation or unit test files: {listing}. "
-            "Agents may not write these. Undo only the changes you made: delete files you "
+            f"WONTDO: this session changed files it may not write: {listing}. "
+            f"Agents may not do {BANNED}. Undo only the changes you made: delete files you "
             "created and reverse your own edits by hand. Do not use git restore, git checkout "
             "or git stash, because these files may hold the user's uncommitted work. If you "
             "did not make a change, leave it alone and say so. Then finish."
