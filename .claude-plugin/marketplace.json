@@ -1,0 +1,12 @@
+{
+  "name": "wontdo",
+  "description": "Things agents won't do.",
+  "owner": { "name": "khalidsaidi" },
+  "plugins": [
+    {
+      "name": "wontdo",
+      "source": "./",
+      "description": "Looks over the agent's shoulder: won't doc, won't test."
+    }
+  ]
+}
