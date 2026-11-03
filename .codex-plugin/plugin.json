@@ -2,6 +2,5 @@
   "name": "wontdo",
   "version": "0.1.0",
   "description": "Looks over the agent's shoulder: won't doc, won't test.",
-  "skills": "./codex/skills/",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./codex/skills/"
 }
