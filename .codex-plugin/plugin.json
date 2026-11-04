@@ -1,6 +1,6 @@
 {
   "name": "wontdo",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Looks over the agent's shoulder: no docs, no unit tests, no CI, no PRs.",
   "skills": "./codex/skills/"
 }

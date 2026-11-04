@@ -11,7 +11,7 @@
       {
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow",
         "hooks": [
-          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" pre", "timeout": 30 }
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" pre", "timeout": 30, "onFailure": "block" }
         ]
       }
     ],

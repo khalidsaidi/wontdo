@@ -38,20 +38,43 @@ THIRD_PARTY_DIRS = {"node_modules", "vendor", ".venv", "venv", "dist", "build", 
 E2E_DIRS = {"e2e", "playwright", "cypress"}
 AGENT_FILES = {"claude.md", "agents.md", "gemini.md", "skill.md", "license.md"}
 
-TEST_DIRS = {"test", "tests", "__tests__", "__snapshots__", "__mocks__"}
+TEST_DIRS = {"test", "tests", "testing", "__test__", "__tests__", "__snapshots__", "__mocks__"}
+SPEC_DIRS = {"spec", "specs"}
+CODE_EXT = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java",
+    ".kt", ".rb", ".cs", ".swift", ".php", ".scala", ".groovy",
+}
 TEST_NAME = re.compile(
-    r"^test_.+|.+_test\.\w+$|.+\.(test|spec)\.\w+$|.+_spec\.\w+$"
+    r"^test_.+|^tests?\.\w+$|.+_test\.\w+$|.+\.(test|tests|spec)\.\w+$|.+_spec\.\w+$"
     r"|.+(Test|Tests|Spec)\.(java|kt|cs|swift|scala|php|groovy)$"
     r"|^conftest\.py$|^pytest\.ini$|^(jest|vitest)\.config\.\w+$"
 )
 DOC_EXT = {".md", ".mdx", ".markdown", ".rst", ".adoc", ".asciidoc"}
-DOC_STEM = {"readme", "changelog", "changes", "history", "contributing", "authors"}
+DOC_STEM = {
+    "readme", "changelog", "changes", "history", "contributing", "authors", "usage",
+    "notes", "guide", "tutorial", "faq", "installation",
+}
+DOC_STEM_EXT = {"", ".txt", ".html", ".htm", ".pdf"}
+DOC_DIRS = {"doc", "docs", "documentation", "guide", "guides", "manual"}
+DOC_PAGE_EXT = {".txt", ".html", ".htm", ".pdf"}
 TOP_DOC_DIRS = {"doc", "docs"}
+DOC_TOOL_FILE = re.compile(
+    r"^(mkdocs\.ya?ml|\.readthedocs\.ya?ml|typedoc\.json|jsdoc\.json|docusaurus\.config\.\w+)$", re.I
+)
 CI_FILES = {
     ".gitlab-ci.yml", ".travis.yml", ".drone.yml", "appveyor.yml", ".appveyor.yml",
-    "azure-pipelines.yml", "bitbucket-pipelines.yml", "jenkinsfile",
+    "azure-pipelines.yml", "bitbucket-pipelines.yml", "cloudbuild.yml", ".woodpecker.yml",
+    ".cirrus.yml", "bitrise.yml", ".pre-commit-config.yml",
 }
-CI_DIRS = {".circleci", ".buildkite"}
+CI_DIRS = {".circleci", ".buildkite", ".semaphore", ".woodpecker", ".teamcity", ".tekton"}
+CI_WORKFLOW_PARENTS = {".github", ".gitea", ".forgejo"}
+
+# wontdo's own off switches ----------------------------------------------------
+
+SWITCH_WORDS = re.compile(
+    r"wontdo|enabledPlugins|disableAllHooks|allowManagedHooksOnly|\bhooks\s*=|hooks\.state", re.I
+)
+OFF_KIND = "wontdo's own off switch"
 
 
 def repo_root(start):
@@ -76,9 +99,64 @@ def ignored(rel, root):
     return any(fnmatch.fnmatch(rel, g) for g in globs)
 
 
+def absolute_path(path, cwd):
+    return os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
+
+
+def inside(absolute, folder):
+    folder = str(folder)
+    return absolute == folder or absolute.startswith(folder + "/")
+
+
+def is_wontdo_file(absolute):
+    home = Path.home()
+    folders = [
+        Path(__file__).resolve().parent.parent, HOME,
+        home / ".claude" / "plugins", home / ".codex" / "plugins",
+    ]
+    return any(inside(absolute, f) for f in folders)
+
+
+def is_agent_settings(absolute):
+    parent, name = os.path.split(absolute)
+    folder = os.path.basename(parent)
+    if folder == ".claude":
+        return bool(re.match(r"^settings.*\.json$", name))
+    return folder == ".codex" and name in {"config.toml", "hooks.json", "requirements.toml"}
+
+
+def settings_text(tool, tool_input, absolute):
+    """Return what an edit touches in a settings file, or None if it can't be known."""
+    if tool == "Edit":
+        return (tool_input.get("old_string") or "") + "\n" + (tool_input.get("new_string") or "")
+    if tool == "MultiEdit":
+        edits = tool_input.get("edits", [])
+        return "\n".join(e.get("old_string", "") + "\n" + e.get("new_string", "") for e in edits)
+    if tool == "apply_patch":
+        return tool_input.get("command") or ""
+    if tool == "Write":
+        try:
+            current = Path(absolute).read_text()
+        except OSError:
+            current = ""
+        return current + "\n" + (tool_input.get("content") or "")
+    return None
+
+
+def off_switch(path, cwd, tool, tool_input):
+    absolute = absolute_path(path, cwd)
+    if is_wontdo_file(absolute):
+        return OFF_KIND
+    if is_agent_settings(absolute):
+        text = settings_text(tool, tool_input, absolute)
+        if text is None or SWITCH_WORDS.search(text):
+            return OFF_KIND
+    return None
+
+
 def classify(path, cwd):
     """Return 'documentation', 'a unit test', 'CI config', 'wontdo config' or None."""
-    absolute = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
+    absolute = absolute_path(path, cwd)
     root = repo_root(cwd)
     rel = absolute
     if root and absolute.startswith(str(root) + "/"):
@@ -94,17 +172,23 @@ def classify(path, cwd):
         return None
     if root and ignored(rel, root):
         return None
-    in_github_ci = any(
-        a == ".github" and b in {"workflows", "actions"} for a, b in zip(dirs, dirs[1:])
+    in_workflows = any(
+        a in CI_WORKFLOW_PARENTS and b in {"workflows", "actions"} for a, b in zip(dirs, dirs[1:])
     )
-    if in_github_ci or set(dirs) & CI_DIRS or name.lower() in CI_FILES:
+    ci_name = re.sub(r"\.yaml$", ".yml", name.lower())
+    if in_workflows or set(dirs) & CI_DIRS or ci_name in CI_FILES or re.match(r"^jenkinsfile(\.|$)", ci_name):
         return "CI config"
-    if not set(dirs) & E2E_DIRS and (set(dirs) & TEST_DIRS or TEST_NAME.match(name)):
-        return "a unit test"
     stem, ext = os.path.splitext(name)
+    in_spec_dir = set(dirs) & SPEC_DIRS and ext.lower() in CODE_EXT
+    if not set(dirs) & E2E_DIRS and (set(dirs) & TEST_DIRS or in_spec_dir or TEST_NAME.match(name)):
+        return "a unit test"
     if name.lower() in AGENT_FILES:
         return None
-    if ext.lower() in DOC_EXT or stem.lower() in DOC_STEM:
+    if ext.lower() in DOC_EXT or DOC_TOOL_FILE.match(name):
+        return "documentation"
+    if stem.lower() in DOC_STEM and ext.lower() in DOC_STEM_EXT:
+        return "documentation"
+    if {d.lower() for d in dirs} & DOC_DIRS and ext.lower() in DOC_PAGE_EXT:
         return "documentation"
     if root and absolute != rel and dirs and dirs[0] in TOP_DOC_DIRS:
         return "documentation"
@@ -210,20 +294,32 @@ PR_READ_ONLY = {"view", "list", "diff", "checks", "status", "checkout"}
 MCP_READ_ONLY = re.compile(r"^(get|list|search|read|view)", re.I)
 MCP_BANNED = re.compile(r"(pull_?request|merge_?request|workflow)", re.I)
 API_BANNED = re.compile(r"/pulls\b|/merge_requests\b|/dispatches\b|/rerun\b|\b(createPullRequest|mergePullRequest)\b")
+RAW_API_WRITE = re.compile(
+    r"(/pulls\b|/merge_requests\b|/dispatches\b).*(\.post\(|--post|method\W{1,4}POST|-X\s*POST)"
+    r"|(\.post\(|--post|method\W{1,4}POST|-X\s*POST).*(/pulls\b|/merge_requests\b|/dispatches\b)"
+    r"|merge_request\.create",
+    re.I | re.S,
+)
+GH_COMMANDS = {
+    "alias", "api", "attestation", "auth", "browse", "cache", "codespace", "completion",
+    "config", "extension", "gist", "gpg-key", "help", "issue", "label", "org", "pr",
+    "project", "release", "repo", "ruleset", "run", "search", "secret", "ssh-key",
+    "status", "variable", "workflow",
+}
 API_WRITES = re.compile(r"(^|\s)(-[fFd]|--field|--raw-field|--input|--data\S*|-X\s*(POST|PUT|PATCH|DELETE)|--method[ =](POST|PUT|PATCH|DELETE)|--request[ =](POST|PUT|PATCH|DELETE))(\s|=|$)|createPullRequest|mergePullRequest")
 
 
-def banned_words(words):
-    """Return (what, kind) if one shell command is a PR or CI action."""
+def banned_words(words, cwd):
+    """Return (what, kind) if one shell command is a banned action."""
     while words and (re.match(r"^\w+=", words[0]) or words[0] in {"sudo", "command", "env", "time", "exec", "xargs"}):
         words = words[1:]
     if not words:
         return None
     cmd, args = os.path.basename(words[0]), words[1:]
     if cmd in {"sh", "bash", "zsh", "dash"} and "-c" in args[:-1]:
-        return banned_action(args[args.index("-c") + 1])
+        return banned_action(args[args.index("-c") + 1], cwd)
     if cmd == "eval":
-        return banned_action(" ".join(args))
+        return banned_action(" ".join(args), cwd)
 
     plain, skip = [], False
     for arg in args:
@@ -237,6 +333,21 @@ def banned_words(words):
     label = " ".join([cmd, head, sub]).strip()
     joined = " ".join(args)
 
+    if cmd in {"rm", "mv", "chmod", "chown", "truncate", "unlink", "shred"}:
+        if any(is_wontdo_file(absolute_path(a, cwd)) or is_agent_settings(absolute_path(a, cwd)) for a in plain):
+            return label, OFF_KIND
+    if cmd in {"claude", "codex"} and "plugin" in plain:
+        removing = {"disable", "uninstall", "remove", "rm"} & set(plain)
+        if removing and ("wontdo" in joined or "--all" in args or "-a" in args):
+            return label, OFF_KIND
+    if cmd == "claude" and "--bare" in args:
+        return label, OFF_KIND
+    if cmd == "codex" and re.search(r"(--disable[ =]hooks|features\.(codex_)?hooks=false|allow_managed_hooks_only)", joined):
+        return label, OFF_KIND
+    if cmd == "gh" and head and head not in GH_COMMANDS:
+        return label, "an unknown gh command that could open a pull request"
+    if cmd == "gh" and ((head == "alias" and sub in {"set", "import"}) or (head == "extension" and sub in {"install", "exec", "create"})):
+        return label, "a way to hide a pull request action"
     if cmd == "gh" and head == "pr" and sub not in PR_READ_ONLY:
         return label, "a pull request action"
     if cmd == "glab" and head == "mr" and sub not in PR_READ_ONLY:
@@ -247,29 +358,33 @@ def banned_words(words):
         return label, "a CI action"
     if cmd == "glab" and head == "ci" and sub in {"run", "retry", "trigger"}:
         return label, "a CI action"
-    if ((cmd == "gh" and head == "api") or cmd in {"curl", "http", "https"}) and (
+    if ((cmd == "gh" and head == "api") or cmd in {"curl", "wget", "http", "https"}) and (
         API_BANNED.search(joined) and API_WRITES.search(joined)
     ):
         return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
     return None
 
 
-def banned_action(command):
+def banned_action(command, cwd):
+    if "WONTDO_OFF" in command:
+        return "WONTDO_OFF", OFF_KIND
+    if RAW_API_WRITE.search(command):
+        return "a write to a pull request or CI endpoint", "a pull request or CI action"
     try:
         tokens = tokenize(command)
     except ValueError:
         match = re.search(r"\b(gh\s+pr\s+(?!view|list|diff|checks|status|checkout)\w+|gh\s+workflow\s+run|hub\s+pull-request)", command)
         return (match.group(1), "a pull request or CI action") if match else None
     for words in segments(tokens):
-        found = banned_words(words)
+        found = banned_words(words, cwd)
         if found:
             return found
     return None
 
 
-def banned_tool(tool, tool_input):
+def banned_tool(tool, tool_input, cwd):
     if tool == "Bash":
-        return banned_action(tool_input.get("command") or "")
+        return banned_action(tool_input.get("command") or "", cwd)
     if tool.startswith("mcp__"):
         name = tool.rsplit("__", 1)[-1]
         if MCP_BANNED.search(name) and not MCP_READ_ONLY.match(name):
@@ -326,16 +441,70 @@ def file_hash(path):
         return None
 
 
-def dirty_guarded(root):
-    """Return {relative path: hash} for changed or new guarded files in a repo."""
+def dirty_files(root):
+    """Return {relative path: hash} for every changed or new file in a repo."""
     out = git(root, "status", "--porcelain=v1", "-z", "-uall", "--no-renames")
     found = {}
     for entry in filter(None, out.split("\0")):
         status, rel = entry[:2], entry[3:]
-        if "D" in status:
+        if "D" in status or set(rel.split("/")[:-1]) & THIRD_PARTY_DIRS:
             continue
-        if classify(str(root / rel), str(root)):
-            found[rel] = file_hash(root / rel)
+        found[rel] = file_hash(root / rel)
+    return found
+
+
+def added_text(root, rel, *revisions):
+    """Return the lines a diff adds to a file, or all of it if git doesn't track it."""
+    out = git(root, "diff", "-U0", *revisions, "--", rel)
+    if out:
+        return "\n".join(l[1:] for l in out.splitlines() if l.startswith("+") and not l.startswith("+++"))
+    try:
+        path = root / rel
+        return path.read_text(errors="ignore") if path.stat().st_size < 1_000_000 else ""
+    except OSError:
+        return ""
+
+
+def banned_change(root, rel, *revisions):
+    kind = classify(str(root / rel), str(root))
+    if kind:
+        return kind
+    if os.path.splitext(rel)[1].lower() in CODE_EXT:
+        return content_kind(rel, added_text(root, rel, *revisions))
+    return None
+
+
+def dirty_violations(root, baseline, head):
+    """Return {path: kind} for banned changes in the working tree since the baseline."""
+    found = {}
+    for rel, digest in dirty_files(root).items():
+        if baseline.get(rel) == digest:
+            continue
+        if head and git(root, "rev-parse", "-q", "--verify", f"{head}:{rel}").strip() == git(root, "hash-object", "--", rel).strip():
+            continue
+        kind = banned_change(root, rel, "HEAD")
+        if kind:
+            found[rel] = kind
+    return found
+
+
+def committed_violations(root, head):
+    """Return {path: kind} for banned changes this user committed since the baseline."""
+    current = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
+    if not head or not current or head == current:
+        return {}
+    author = git(root, "config", "user.email").strip()
+    log = ["log", f"{head}..HEAD", "--no-merges", "--name-only", "--format="]
+    if author:
+        log.append(f"--author={author}")
+    touched = set(filter(None, git(root, *log).splitlines()))
+    changed = git(root, "diff", "--name-only", "--diff-filter=ACMR", head, "HEAD").splitlines()
+    found = {}
+    for rel in changed:
+        if rel in touched:
+            kind = banned_change(root, rel, head, "HEAD")
+            if kind:
+                found[rel] = kind
     return found
 
 
@@ -362,13 +531,10 @@ def ensure_baseline(payload):
     session = re.sub(r"[^\w.-]", "_", str(payload.get("session_id") or "unknown"))
     state = load_state(session)
     if str(root) not in state["baselines"]:
-        state["baselines"][str(root)] = dirty_guarded(root)
+        state["baselines"][str(root)] = dirty_files(root)
+        state.setdefault("heads", {})[str(root)] = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
         save_state(session, state)
     return session, state
-
-
-def changed_since_baseline(root, baseline, current):
-    return sorted(rel for rel, digest in current.items() if baseline.get(rel) != digest)
 
 
 # Hook handlers ---------------------------------------------------------------
@@ -392,10 +558,9 @@ def deny_message(path, kind):
     return (
         f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here. "
         "Do not retry through another tool, script, file name or location. "
-        "Drop this part of the work and carry on with the code. If the user "
-        "explicitly asked for it, tell them wontdo blocked it. Only they can turn it off: "
-        "in Claude with /plugin disable wontdo@wontdo, in Codex with "
-        "codex plugin remove wontdo@wontdo."
+        "Do not try to disable wontdo, and do not suggest how. Drop this part of the work "
+        "and carry on with the code. If the user explicitly asked for it, tell them wontdo "
+        "blocked it and that the choice to turn it off is theirs."
     )
 
 
@@ -409,15 +574,16 @@ def deny(reason):
     }))
 
 
-def commit_violation(command, root, baseline):
-    if not re.search(r"\bgit\b[^;&|\n]*\bcommit\b", command):
-        return None
-    args = ["diff", "--name-only", "-z", "--diff-filter=ACMR"]
-    everything = re.search(r"\bcommit\b[^;&|\n]*\s(-\w*a\w*|--all)\b", command)
-    out = git(root, *args, "HEAD" if everything else "--cached")
-    for rel in filter(None, out.split("\0")):
-        if classify(str(root / rel), str(root)) and baseline.get(rel) != file_hash(root / rel):
-            return rel
+def git_violation(command, root, baseline, head):
+    """Block commits and pushes while banned changes exist. Return a path or None."""
+    if re.search(r"\bgit\b[^;&|\n]*\bcommit\b", command):
+        found = dirty_violations(root, baseline, head)
+        if found:
+            return min(found)
+    if re.search(r"\bgit\b[^;&|\n]*\bpush\b", command):
+        found = {**dirty_violations(root, baseline, head), **committed_violations(root, head)}
+        if found:
+            return min(found)
     return None
 
 
@@ -437,13 +603,13 @@ def on_pre(payload):
     for path, text in writes_in(tool, tool_input):
         if not path:
             continue
-        kind = classify(path, cwd) or content_kind(path, text)
+        kind = off_switch(path, cwd, tool, tool_input) or classify(path, cwd) or content_kind(path, text)
         if kind:
             record(payload, "pre", kind, path)
             deny(deny_message(path, kind))
             return
 
-    action = banned_tool(tool, tool_input)
+    action = banned_tool(tool, tool_input, cwd)
     if action:
         record(payload, "pre", action[1], action[0])
         deny(deny_message(*action))
@@ -452,10 +618,11 @@ def on_pre(payload):
     root = repo_root(cwd)
     if tool == "Bash" and root and state:
         baseline = state["baselines"].get(str(root), {})
-        rel = commit_violation(tool_input.get("command") or "", root, baseline)
+        head = state.get("heads", {}).get(str(root))
+        rel = git_violation(tool_input.get("command") or "", root, baseline, head)
         if rel:
-            record(payload, "commit", "commit", rel)
-            deny(deny_message(rel, "a banned file staged for commit"))
+            record(payload, "commit", "a banned change", rel)
+            deny(deny_message(rel, "a banned change, so it can't be committed or pushed"))
 
 
 def on_stop(payload):
@@ -464,7 +631,9 @@ def on_stop(payload):
         return
     session, state = ensure_baseline(payload)
     baseline = state["baselines"].get(str(root), {})
-    changed = changed_since_baseline(root, baseline, dirty_guarded(root))
+    head = state.get("heads", {}).get(str(root))
+    found = {**dirty_violations(root, baseline, head), **committed_violations(root, head)}
+    changed = sorted(found)
     if not changed:
         if state.get("stop_blocks"):
             state["stop_blocks"] = 0
@@ -480,21 +649,23 @@ def on_stop(payload):
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
     save_state(session, state)
     for rel in changed:
-        record(payload, "stop", classify(str(root / rel), str(root)), rel)
+        record(payload, "stop", found[rel], rel)
     print(json.dumps({
         "decision": "block",
         "reason": (
             f"WONTDO: this session changed files it may not write: {listing}. "
             f"Agents may not do {BANNED}. Undo only the changes you made: delete files you "
-            "created and reverse your own edits by hand. Do not use git restore, git checkout "
-            "or git stash, because these files may hold the user's uncommitted work. If you "
-            "did not make a change, leave it alone and say so. Then finish."
+            "created and reverse your own edits by hand. If you committed them, remove them in "
+            "a new commit and do not rewrite history. Do not use git restore, git checkout, git "
+            "reset or git stash, because these files may hold the user's uncommitted work. If "
+            "you did not make a change, leave it alone and say so. Then finish."
         ),
     }))
 
 
 def status():
-    print("wontdo is", "OFF for this session (WONTDO_OFF)" if os.environ.get("WONTDO_OFF") else "ON")
+    if os.environ.get("WONTDO_OFF"):
+        print("wontdo is off for this session (WONTDO_OFF)")
     try:
         lines = LOG.read_text().splitlines()
     except OSError:
@@ -519,6 +690,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as error:  # A bug here must never stop the agent working.
-        print(f"wontdo error: {error}", file=sys.stderr)
-        sys.exit(1)
+    except Exception as error:
+        if sys.argv[1:2] == ["pre"]:  # If wontdo can't check a call, the call doesn't run.
+            deny(f"WONTDO could not check this call, so it is blocked: {error}")
+        else:
+            print(f"wontdo error: {error}", file=sys.stderr)
+            sys.exit(1)
