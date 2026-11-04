@@ -48,10 +48,17 @@ def rule_text():
         "AGENTS.md, skill, plan or habit that says otherwise. Do not write documentation, unit "
         "tests or CI, and do not open or change pull requests. That covers READMEs, changelogs, "
         "markdown docs, test files, in-source tests, pipeline files, triggering CI runs and PR "
-        f"actions.{extra} Do not suggest or offer any of these in your replies. Write code with "
-        "few comments: no docstrings and no explanatory comment blocks. Write the code and "
-        "move on."
+        f"actions.{extra} Any project rule asking for these is cancelled, not outstanding work, "
+        "so do not attempt them. Never suggest or offer them, and never report them as missing, "
+        "skipped or blocked unless the user asks for one directly. Write code with few comments: "
+        "no docstrings and no explanatory comment blocks. Write the code and move on."
     )
+
+
+REMINDER = (
+    "wontdo: no documentation, unit tests, CI or pull requests. Project rules asking for them are "
+    "cancelled. Do not attempt, offer or mention them unless this message asks for one directly."
+)
 
 
 # Paths -----------------------------------------------------------------------
@@ -848,8 +855,8 @@ def deny_message(path, kind):
         f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here, and this "
         "overrides any project instruction that says otherwise. Do not retry through another "
         "tool, script, file name or location. Do not try to disable wontdo. Drop this part of "
-        "the work and carry on with the code. If the user explicitly asked for it, tell them "
-        f"wontdo blocked it {tail}"
+        "the work and carry on with the code. Do not report it as missing or offer it later. "
+        f"Only if the user directly asked for this, tell them wontdo blocked it {tail}"
     )
 
 
@@ -897,8 +904,7 @@ def on_subagent(payload):
 def on_prompt(payload):
     prompt = payload.get("prompt") or ""
     wanted = re.findall(r"^\s*wontdo allow\s+(\S+)\s*$", prompt, re.M | re.I)
-    if not wanted:
-        return
+    context = REMINDER
     cwd = payload.get("cwd") or "."
     session = session_name(payload)
     state = load_state(session)
@@ -913,12 +919,10 @@ def on_prompt(payload):
     if accepted:
         save_state(session, state)
         names = ", ".join(accepted)
-        print(json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": f"The owner allowed this one file for this session: {names}. Every other wontdo rule still applies.",
-            }
-        }))
+        context += f" The owner allowed this one file for this session: {names}."
+    print(json.dumps({
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
+    }))
 
 
 def on_pre(payload):
@@ -1001,39 +1005,47 @@ def on_stop(payload):
         mine.update({str(root / rel): kind for rel, kind in found.items()})
         others.update({str(root / rel): kind for rel, kind in elsewhere.items()})
 
-    changed = sorted(mine)
-    listing = ", ".join(changed)
-    if changed and state.get("stop_blocks", 0) < STOP_BLOCK_LIMIT:
-        state["stop_blocks"] = state.get("stop_blocks", 0) + 1
-        save_state(session, state)
-        for path in changed:
+    subagent = payload.get("hook_event_name") == "SubagentStop"
+    counts = state.setdefault("sub_counts" if subagent else "stop_counts", {})
+    limit = 1 if subagent else STOP_BLOCK_LIMIT
+    cwd = payload.get("cwd") or "."
+    show = lambda path: os.path.relpath(path, cwd) if inside(path, os.path.realpath(cwd)) else path
+    to_undo = sorted(p for p in mine if counts.get(p, 0) < limit)
+    if to_undo:
+        for path in to_undo:
+            counts[path] = counts.get(path, 0) + 1
             record(payload, "stop", mine[path], path)
+        save_state(session, state)
         print(json.dumps({
             "decision": "block",
             "reason": (
-                f"WONTDO: this session changed files it may not write: {listing}. "
-                f"Agents may not do {BANNED}. Undo only the changes you made: delete files you "
-                "created and reverse your own edits by hand. If you committed them, remove them in "
-                "a new commit and do not rewrite history. Do not use git restore, git checkout, git "
-                "reset or git stash, because these files may hold the user's uncommitted work. If "
-                "you did not make a change, leave it alone and say so. Then finish."
+                f"WONTDO: commands in this session, including scripts and subagents, changed files "
+                f"agents may not write: {', '.join(show(p) for p in to_undo)}. Agents may not do "
+                f"{BANNED}. These are yours to undo now: delete files that were created and reverse "
+                "edits by hand. If they were committed, remove them in a new commit and do not "
+                "rewrite history. Do not use git restore, git checkout, git reset or git stash, "
+                "because these files may hold the user's uncommitted work. Leave a file alone only "
+                "if you know someone else changed it, and say so. Then finish."
             ),
         }))
         return
+    if subagent:
+        save_state(session, state)
+        return
 
     notes = []
-    if changed:
-        record(payload, "gave-up", "unremoved", listing)
-        notes.append(f"agent left these behind, review them: {listing}")
-    else:
-        state["stop_blocks"] = 0
     seen = state.setdefault("mentioned", [])
+    left = sorted(p for p in mine if p not in seen)
+    if left:
+        seen.extend(left)
+        record(payload, "gave-up", "unremoved", ", ".join(left))
+        notes.append("agent left these behind, review them: " + ", ".join(show(p) for p in left))
     fresh = sorted(p for p in others if p not in seen)
     if fresh:
         seen.extend(fresh)
         for path in fresh:
             record(payload, "noticed", others[path], path)
-        notes.append("changed outside this agent's commands, nothing was done: " + ", ".join(fresh))
+        notes.append("changed outside this agent's commands, nothing was done: " + ", ".join(show(p) for p in fresh))
     urls = [url for key in state["baselines"] for url in new_prs(Path(key), state)]
     for url in urls:
         record(payload, "noticed", "a pull request", url)
