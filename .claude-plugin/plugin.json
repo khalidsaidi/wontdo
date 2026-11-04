@@ -1,5 +1,5 @@
 {
   "name": "wontdo",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Looks over the agent's shoulder: no docs, no unit tests, no CI, no PRs."
 }

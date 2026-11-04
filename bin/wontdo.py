@@ -26,6 +26,7 @@ LOG = HOME / "log.jsonl"
 SESSIONS = HOME / "sessions"
 IGNORE_FILE = ".wontdoignore"
 STOP_BLOCK_LIMIT = 3
+MAX_CALL_SECONDS = 1800
 BANNED = "documentation, unit tests, CI or pull requests"
 OFF_KIND = "wontdo's own off switch"
 COMMENT_KIND = "a long comment or docstring"
@@ -87,22 +88,24 @@ TEST_CODE_EXT = CODE_EXT | {
     ".ex", ".exs", ".dart", ".m", ".mm", ".r", ".zig", ".sol",
 }
 DATA_EXT = {".json", ".yml", ".yaml", ".toml", ".csv", ".log"}
-TEST_DIRS = {"test", "tests", "__test__", "__tests__", "__snapshots__", "__mocks__"}
+TEST_DIRS = {"test", "tests", "__test__", "__tests__", "__snapshots__", "__mocks__", "unit_tests", "unittests"}
 TEST_CODE_DIRS = {"testing", "spec", "specs"}
 TEST_NAME = re.compile(
-    r".+\.(test|tests|spec)\.\w+$|.+_spec\.\w+$"
-    r"|.+(Test|Tests|Spec)\.(java|kt|cs|swift|scala|php|groovy)$"
+    r".+(Test|Tests)\.(java|kt|cs|swift|scala|php|groovy)$|.+Spec\.(scala|groovy)$"
+    r"|^Test[A-Z]\w*\.(java|kt|cs|swift|php)$"
     r"|^conftest\.py$|^pytest\.ini$|^(jest|vitest)\.config\.\w+$"
 )
-TEST_CODE_NAME = re.compile(r"^test_.+|^tests?\.\w+$|.+_test\.\w+$")
-E2E = re.compile(r"e2e|cypress|playwright", re.I)
+TEST_CODE_NAME = re.compile(r"^test_.+|^tests?\.\w+$|.+[._-](test|tests|spec|unittest)\.\w+$")
+E2E_DIR = re.compile(r"(^|[-_.])(e2e|cypress|playwright)($|[-_.])", re.I)
+E2E_NAME = re.compile(r"\.e2e[.-]", re.I)
 
-DOC_EXT = {".md", ".mdx", ".markdown", ".rst", ".adoc", ".asciidoc"}
+DOC_EXT = {".md", ".mdx", ".markdown", ".rst", ".adoc", ".asciidoc", ".org", ".rdoc"}
 DOC_STEM = {
     "readme", "changelog", "changes", "history", "contributing", "authors", "usage",
-    "notes", "guide", "tutorial", "faq", "installation",
+    "notes", "guide", "tutorial", "faq", "installation", "news", "roadmap", "howto",
 }
-DOC_STEM_EXT = {"", ".txt", ".html", ".htm", ".pdf"}
+DOC_STEM_EXT = {"", ".txt"}
+PAGE_STEM = re.compile(r"^(readme|changelog)(\.[\w-]+)?\.(txt|html?|pdf)$", re.I)
 DOC_DIRS = {"doc", "docs", "documentation", "guide", "guides", "manual"}
 DOC_PAGE_EXT = {".txt", ".html", ".htm"}
 TOP_DOC_DIRS = {"doc", "docs"}
@@ -113,22 +116,32 @@ DOC_TOOL_FILE = re.compile(
 CI_FILES = {
     ".gitlab-ci.yml", ".travis.yml", ".drone.yml", "appveyor.yml", ".appveyor.yml",
     "azure-pipelines.yml", "bitbucket-pipelines.yml", "cloudbuild.yml", ".woodpecker.yml",
-    ".cirrus.yml", "bitrise.yml", ".pre-commit-config.yml",
+    ".cirrus.yml", "bitrise.yml", ".pre-commit-config.yml", "circle.yml", "codefresh.yml",
+    "action.yml",
 }
-CI_DIRS = {".circleci", ".buildkite", ".semaphore", ".woodpecker", ".teamcity", ".tekton"}
+CI_DIRS = {".circleci", ".buildkite", ".semaphore", ".woodpecker", ".teamcity", ".tekton", ".azuredevops"}
 CI_WORKFLOW_PARENTS = {".github", ".gitea", ".forgejo"}
 
 SWITCH_WORDS = re.compile(
-    r"wontdo|enabledPlugins|disableAllHooks|allowManagedHooksOnly|\bhooks\s*=|hooks\.state", re.I
+    r"wontdo|enabledPlugins|disableAllHooks|allowManagedHooksOnly|hooks\s*=|hooks\.state", re.I
 )
+OFF_IN_SCRIPT = re.compile(r"\.wontdo\b|\.claude/settings|\.codex/config\.toml|disableAllHooks")
+OFF_DESTROY = re.compile(
+    r"(\brm\s|rmtree|unlink|-delete\b|remove\()[^\n]*(\.wontdo\b|plugins/[^\s'\"]*wontdo)"
+    r"|(\.wontdo\b|plugins/[^\s'\"]*wontdo)[^\n]*-delete\b"
+)
+IGNORES = None
 
 
 def repo_root(start):
-    p = Path(start).resolve()
-    for candidate in [p, *p.parents]:
-        marker = candidate / ".git"
-        if marker.is_file() or (marker / "HEAD").exists():
-            return candidate
+    try:
+        p = Path(start).resolve()
+        for candidate in [p, *p.parents]:
+            marker = candidate / ".git"
+            if marker.is_file() or (marker / "HEAD").exists():
+                return candidate
+    except OSError:
+        pass
     return None
 
 
@@ -138,11 +151,12 @@ def temp_dirs():
 
 
 def ignored(rel, root):
-    try:
-        lines = (root / IGNORE_FILE).read_text().splitlines()
-    except OSError:
-        return False
-    globs = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+    """Honour the ignore file as it was when the session began, so agents can't widen it."""
+    if IGNORES is None:
+        text = read_small(root / IGNORE_FILE)
+    else:
+        text = IGNORES.get(str(root), "")
+    globs = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
     return any(fnmatch.fnmatch(rel, g) for g in globs)
 
 
@@ -196,6 +210,8 @@ def off_switch(path, cwd, tool, tool_input):
         text = settings_text(tool, tool_input, absolute)
         if text is None or SWITCH_WORDS.search(text):
             return OFF_KIND
+        if "false" in text.lower() and "wontdo" in read_small(absolute):
+            return OFF_KIND
     return None
 
 
@@ -210,10 +226,13 @@ def extra_kind(rel_parts):
 
 
 def test_kind(dirs, name, ext):
-    if any(E2E.search(d) for d in dirs) or E2E.search(name):
+    if any(E2E_DIR.search(d) for d in dirs) or E2E_NAME.search(name):
         return None
     code = ext.lower() in TEST_CODE_EXT
-    if set(dirs) & TEST_DIRS or (code and set(dirs) & TEST_CODE_DIRS):
+    lower_dirs = {d.lower() for d in dirs}
+    if lower_dirs & TEST_DIRS or (code and lower_dirs & TEST_CODE_DIRS):
+        return "a unit test"
+    if ext == ".t" and "t" in lower_dirs:
         return "a unit test"
     if TEST_NAME.match(name) or (code and TEST_CODE_NAME.match(name)):
         return "a unit test"
@@ -229,7 +248,9 @@ def doc_kind(dirs, name, stem, ext, in_repo):
         return "documentation"
     if DOC_TOOL_FILE.match(name):
         return "documentation"
-    if stem.lower() in DOC_STEM and (ext in DOC_STEM_EXT or ext in DOC_EXT):
+    if stem.lower() in {"readme", "changelog", "contributing"} and ext in DOC_EXT:
+        return "documentation"
+    if (stem.lower() in DOC_STEM and ext in DOC_STEM_EXT) or name == "INSTALL" or PAGE_STEM.match(name):
         return "documentation"
     if ext in DOC_EXT and (lower_dirs & DOC_DIRS or not lower_dirs & CONTENT_DIRS):
         return "documentation"
@@ -247,7 +268,8 @@ def classify(path, cwd):
     elif any(inside(absolute, d) for d in temp_dirs()):
         return None
     else:
-        rel = absolute
+        real_cwd = os.path.realpath(cwd)
+        rel = absolute[len(real_cwd) + 1:] if inside(absolute, real_cwd) else "/".join(absolute.split("/")[-2:])
     parts = rel.strip("/").split("/")
     dirs, name = parts[:-1], parts[-1]
 
@@ -264,7 +286,8 @@ def classify(path, cwd):
         a in CI_WORKFLOW_PARENTS and b in {"workflows", "actions"} for a, b in zip(dirs, dirs[1:])
     )
     ci_name = re.sub(r"\.yaml$", ".yml", name.lower())
-    if in_workflows or set(dirs) & CI_DIRS or ci_name in CI_FILES or re.match(r"^jenkinsfile(\.|$)", ci_name):
+    in_gitlab_ci = any(a == ".gitlab" and b == "ci" for a, b in zip(dirs, dirs[1:]))
+    if in_workflows or in_gitlab_ci or set(dirs) & CI_DIRS or ci_name in CI_FILES or re.match(r"^(jenkinsfile(\.|$)|azure-pipelines-)", ci_name):
         return "CI config"
     stem, ext = os.path.splitext(name)
     return test_kind(dirs, name, ext) or doc_kind(dirs, name, stem, ext, bool(root))
@@ -273,23 +296,31 @@ def classify(path, cwd):
 # File content ----------------------------------------------------------------
 
 IN_SOURCE_TEST = re.compile(
-    r"#\[(cfg\()?test\)?\]"
-    r"|^\s*(async\s+)?def\s+test_\w+\s*\("
+    r"#\[(cfg\()?test\)?\]|#\[\w+::test\]"
     r"|^\s*(import|from)\s+(pytest|unittest)\b"
+    r"|\bclass\s+\w+\((unittest\.)?TestCase\)"
     r"|\bfunc\s+Test[A-Z]\w*\(\w+\s+\*testing\.T\)"
-    r"|^\s*@Test\b"
-    r"|import\.meta\.vitest"
-    r"""|(?<![.\w])(describe|it|test)\s*\(\s*['"`][^'"`]*['"`]\s*,\s*(async\s*)?(\(|function)""",
+    r"|^\s*@Test\b|^\s*\[(Fact|Theory|Test|TestMethod)\]"
+    r"|import\.meta\.vitest|\bDeno\.test\(|\bRSpec\.describe\b"
+    r"""|(?<![.\w])(describe|it|test)(\.\w+)?\s*\(\s*['"`][^'"`]*['"`]\s*,\s*(async\s*)?(\(|function)""",
     re.M,
 )
-COMMENT_LINE = re.compile(r"^\s*(#(?!!)|//|/\*|\*|--\s)")
+PY_TEST_DEF = re.compile(r"^\s*(async\s+)?def\s+test_\w+\s*\(", re.M)
+PY_ASSERT = re.compile(r"\bassert\b|\.assert[A-Z]\w*\(|\bpytest\.")
+HASH_COMMENT_EXT = {".py", ".rb", ".sh", ".bash", ".pl", ".ex", ".exs", ".r"}
 KEEP_COMMENT = re.compile(r"copyright|license|spdx|eslint|noqa|pragma|type:\s*ignore", re.I)
 LONG_COMMENT_LINES = 6
 LONG_DOCSTRING_LINES = 4
 
 
 def content_kind(path, text):
-    return "a unit test" if text and IN_SOURCE_TEST.search(text) else None
+    if not text or os.path.splitext(path)[1].lower() not in TEST_CODE_EXT:
+        return None
+    if any(E2E_DIR.search(d) for d in path.split("/")[:-1]) or E2E_NAME.search(path):
+        return None
+    if IN_SOURCE_TEST.search(text) or (PY_TEST_DEF.search(text) and PY_ASSERT.search(text)):
+        return "a unit test"
+    return None
 
 
 def new_lines(tool, tool_input, absolute, text):
@@ -308,16 +339,30 @@ def new_lines(tool, tool_input, absolute, text):
     return [line for line in (text or "").splitlines() if line not in old]
 
 
-def has_long_comment(lines):
-    run = []
+def has_long_comment(lines, ext):
+    hash_comments = ext in HASH_COMMENT_EXT
+    run, in_block = [], False
     for line in lines + [""]:
-        if COMMENT_LINE.match(line):
+        stripped = line.strip()
+        is_comment = False
+        if hash_comments and stripped.startswith("#") and not stripped.startswith("#!"):
+            is_comment = True
+        elif not hash_comments:
+            if stripped.startswith("/*"):
+                in_block = True
+            if in_block or stripped.startswith("//"):
+                is_comment = True
+            if "*/" in stripped:
+                in_block = False
+        if is_comment:
             run.append(line)
             continue
         if len(run) >= LONG_COMMENT_LINES and not KEEP_COMMENT.search("\n".join(run)):
             return True
         run = []
-    inside_doc, count = None, 0
+    if ext != ".py":
+        return False
+    inside_doc, count, before = None, 0, ""
     for line in lines:
         quotes = re.findall(r'"""|\'\'\'', line)
         if inside_doc:
@@ -326,81 +371,111 @@ def has_long_comment(lines):
                 if count >= LONG_DOCSTRING_LINES:
                     return True
                 inside_doc = None
-        elif len(quotes) == 1 and re.match(r'^\s*[rRbBuU]?("""|\'\'\')', line):
+        elif len(quotes) == 1 and re.match(r'^\s*[rRbBuU]?("""|\'\'\')', line) and (not before or before.endswith(":")):
             inside_doc, count = quotes[0], 1
+        if line.strip():
+            before = line.strip()
     return False
 
 
-def comment_kind(path, cwd, tool, tool_input, text):
-    if not text or os.path.splitext(path)[1].lower() not in TEST_CODE_EXT:
+def comment_kind(path, cwd, tool, tool_input, text, state):
+    ext = os.path.splitext(path)[1].lower()
+    if not text or ext not in TEST_CODE_EXT or is_allowed(path, cwd, state):
+        return None
+    absolute = os.path.realpath(absolute_path(path, cwd))
+    if set(absolute.split("/")[:-1]) & THIRD_PARTY_DIRS or any(inside(absolute, d) for d in temp_dirs()) and not repo_root(os.path.dirname(absolute)):
         return None
     lines = new_lines(tool, tool_input, absolute_path(path, cwd), text)
-    return COMMENT_KIND if has_long_comment(lines) else None
+    return COMMENT_KIND if has_long_comment(lines, ext) else None
 
 
 # Shell commands --------------------------------------------------------------
 
-HEREDOC = re.compile(r"(<<-?\s*['\"]?(\w+)['\"]?[^\n]*)\n.*?\n\s*\2[ \t]*(?=\n|$)", re.S)
 REDIRECTS = {">", ">>", ">|", "&>", "&>>", "<>"}
 SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", ";;"}
-WRAPPERS = {"sudo", "command", "env", "time", "exec", "nohup", "xargs"}
+CONTROL_WORDS = {"if", "then", "else", "elif", "do", "while", "until", "{", "}", "!", "fi", "done", "time", "command", "exec", "nohup", "builtin", "setsid"}
+VALUE_WRAPPERS = {"sudo", "env", "timeout", "nice", "ionice", "stdbuf", "xargs", "flock", "watch"}
+WRAPPER_FLAGS_WITH_VALUE = {"-u", "-g", "-n", "-I", "-P", "-L", "-k", "-s", "-c"}
 SCRIPT_WRITES = [
     re.compile(r"""open\(\s*['"]([^'"]+)['"]\s*,\s*(?:mode\s*=\s*)?['"][^'"]*[wax+]"""),
     re.compile(r"""['"]([^'"]+)['"]\s*\)\s*\.\s*write_(?:text|bytes)"""),
     re.compile(r"""(?:writeFile(?:Sync)?|appendFile(?:Sync)?|createWriteStream|Bun\.write)\(\s*['"]([^'"]+)"""),
 ]
 PR_READ_ONLY = {"view", "list", "diff", "checks", "status", "checkout"}
-MCP_READ_ONLY = re.compile(r"^(get|list|search|read|view)", re.I)
-MCP_BANNED = re.compile(r"(pull_?request|merge_?request|workflow)", re.I)
+MCP_READ_ONLY = re.compile(r"^(get|list|search|read|view)|_(get|list|search|read|view)$", re.I)
+MCP_BANNED = re.compile(r"(pull_?request|merge_?request|workflow|_pr\b|^create_pr|pending_review|request_copilot_review)", re.I)
 API_BANNED = re.compile(r"/pulls\b|/merge_requests\b|/dispatches\b|/rerun\b|\b(createPullRequest|mergePullRequest)\b")
-RAW_API_WRITE = re.compile(
-    r"(/pulls\b|/merge_requests\b|/dispatches\b).*(\.post\(|--post|method\W{1,4}POST|-X\s*POST)"
-    r"|(\.post\(|--post|method\W{1,4}POST|-X\s*POST).*(/pulls\b|/merge_requests\b|/dispatches\b)"
-    r"|merge_request\.create",
-    re.I | re.S,
+API_ENDPOINT = re.compile(
+    r"(api\.github\.com|\brepos/[^\s/'\"]+/[^\s/'\"]+/|gitlab\.[\w.]+/api|\bprojects/[^\s/'\"]+/)[^\s'\"]*(pulls\b|/merge_requests\b|/dispatches\b|/rerun\b)"
 )
+GRAPHQL_PR = re.compile(r"\b(create|merge|close|update|reopen)PullRequest\b|enablePullRequestAutoMerge|addPullRequestReview")
+POST_WORD = re.compile(r"\.post\(|--post|--json|method\W{1,4}POST|-X\s*POST|[\"']POST[\"']")
 GH_COMMANDS = {
     "alias", "api", "attestation", "auth", "browse", "cache", "codespace", "completion",
-    "config", "extension", "gist", "gpg-key", "help", "issue", "label", "org", "pr",
-    "project", "release", "repo", "ruleset", "run", "search", "secret", "ssh-key",
-    "status", "variable", "workflow",
+    "config", "copilot", "extension", "gist", "gpg-key", "help", "issue", "label", "models",
+    "org", "pr", "project", "release", "repo", "ruleset", "run", "search", "secret", "ssh-key",
+    "status", "variable", "version", "workflow",
 }
-API_WRITES = re.compile(r"(^|\s)(-[fFd]|--field|--raw-field|--input|--data\S*|-X\s*(POST|PUT|PATCH|DELETE)|--method[ =](POST|PUT|PATCH|DELETE)|--request[ =](POST|PUT|PATCH|DELETE))(\s|=|$)|createPullRequest|mergePullRequest")
+GH_WRITE = re.compile(r"(^|\s)(-[fF]|--field|--raw-field|--input|-X\s*(POST|PUT|PATCH|DELETE)|--method[ =](POST|PUT|PATCH|DELETE))(\s|=|$)")
+CURL_WRITE = re.compile(r"(^|\s)(-\w*d\S*|--data\S*|--json|--form|-F|-\w*X\s*(POST|PUT|PATCH|DELETE)|--request[ =](POST|PUT|PATCH|DELETE)|--post\S*)(\s|=|$)")
+OTHER_PR_TOOLS = re.compile(r"^(az repos pr (create|update)|tea (pulls?|pr) (create|merge|close)|gt (submit|ss)\b|git town (propose|ship)|git-town (propose|ship))")
 SCRIPT_PR = re.compile(
     r"\bgh\s+(-R\s+\S+\s+|--repo[ =]\S+\s+)?pr\s+(create|merge|close|edit|reopen|ready|comment|review)\b"
+    r"|['\"]gh['\"]\s*,\s*['\"]pr['\"]\s*,\s*['\"](create|merge|close|edit|reopen|ready|comment|review)['\"]"
     r"|\bgh\s+workflow\s+(run|enable)\b|\bgh\s+run\s+rerun\b"
     r"|\bhub\s+pull-request\b|\bglab\s+mr\s+(create|merge|update|close)\b|\bglab\s+ci\s+(run|retry|trigger)\b"
-    r"|\b(createPullRequest|mergePullRequest)\b|\.pulls\.create\b|\.create_pull\b"
+    r"|\.pulls\.create\b|\.create_pull\b"
 )
-INTERPRETERS = {
-    "python", "python3", "node", "bash", "sh", "zsh", "dash", "ruby", "perl", "deno", "bun",
-    "tsx", "ts-node",
-}
+SHELLS = {"bash", "sh", "zsh", "dash"}
+INTERPRETERS = SHELLS | {"python", "python3", "node", "ruby", "perl", "deno", "bun", "tsx", "ts-node", "source", "."}
+HEREDOC_START = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 NESTED_RUN = re.compile(r"^\s*(\./|bash |sh |make |npm run |pnpm |yarn |python3? )")
 MAX_SCAN_DEPTH = 3
 
 
+def split_heredocs(command):
+    """Return the command without heredoc bodies, and [(header line, body)]."""
+    kept, bodies, end, header, body = [], [], None, "", []
+    for line in command.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                bodies.append((header, "\n".join(body)))
+                end = None
+            else:
+                body.append(line)
+            continue
+        kept.append(line)
+        match = HEREDOC_START.search(line)
+        if match:
+            end, header, body = match.group(1), line, []
+    if end is not None:
+        bodies.append((header, "\n".join(body)))
+    return "\n".join(kept), bodies
+
+
 def tokenize(command):
-    text = HEREDOC.sub(lambda m: m.group(1), command).replace("\n", " ; ")
+    text, _ = split_heredocs(command)
+    text = "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("#")).replace("\n", " ; ")
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""
     return list(lexer)
 
 
-def segments(tokens):
-    current = []
-    for token in tokens:
-        if token in SEPARATORS:
-            yield current
-            current = []
-        else:
-            current.append(token)
-    yield current
-
-
 def strip_wrappers(words):
-    while words and (re.match(r"^\w+=", words[0]) or words[0] in WRAPPERS):
-        words = words[1:]
+    words = list(words)
+    while words:
+        if re.match(r"^\w+=", words[0]) or words[0] in CONTROL_WORDS:
+            words.pop(0)
+        elif words[0] in VALUE_WRAPPERS:
+            words.pop(0)
+            while words and (words[0].startswith("-") or re.match(r"^\d+\w?$", words[0])):
+                flag = words.pop(0)
+                if flag in WRAPPER_FLAGS_WITH_VALUE and words:
+                    words.pop(0)
+        else:
+            break
     return words
 
 
@@ -419,23 +494,36 @@ def segment_targets(words):
         return [p.rstrip("/") + "/x" for p in plain]
     if cmd in {"cp", "mv", "install", "ln", "rsync"} and len(plain) >= 2:
         dest = plain[-1]
-        return [dest] + [os.path.join(dest, os.path.basename(s.rstrip("/"))) for s in plain[:-1]]
-    if cmd in {"sed", "gsed", "perl", "ruby"} and any(re.match(r"^-\w*i", a) for a in args):
+        if dest.endswith("/") or os.path.isdir(dest) or len(plain) > 2:
+            return [dest] + [os.path.join(dest, os.path.basename(s.rstrip("/"))) for s in plain[:-1]]
+        return [dest]
+    if cmd in {"sed", "gsed", "perl", "ruby"} and any(re.match(r"^(-i|--in-place|-[a-zA-Z]*i$)", a) for a in args):
         return plain[1:]
+    if cmd in {"curl", "wget"}:
+        return [args[i + 1] for i, a in enumerate(args[:-1]) if a in {"-o", "-O", "--output"} and cmd == "curl" and a != "-O" or (cmd == "wget" and a == "-O")]
     if cmd == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     return []
 
 
 def walk_command(command, cwd):
-    """Yield (working folder, words) for each simple command, following cd."""
-    here = cwd
-    for words in segments(tokenize(command)):
-        bare = strip_wrappers(words)
-        if bare[:1] == ["cd"] and len(bare) > 1 and "$" not in bare[1]:
-            here = absolute_path(bare[1], here)
+    """Yield (working folder, words) for each simple command, following cd and subshells."""
+    here, stack, current = cwd, [], []
+    for token in tokenize(command) + [";"]:
+        if token not in SEPARATORS:
+            current.append(token)
             continue
-        yield here, words
+        if current:
+            bare = strip_wrappers(current)
+            if bare[:1] == ["cd"] and len(bare) > 1 and "$" not in bare[1]:
+                here = absolute_path(bare[1], here)
+            else:
+                yield here, current
+            current = []
+        if token == "(":
+            stack.append(here)
+        elif token == ")" and stack:
+            here = stack.pop()
 
 
 def bash_targets(command, cwd):
@@ -471,7 +559,7 @@ def bash_roots(command, cwd):
         for here, words in walk_command(command, cwd):
             candidates.append(here)
             for word in words[:40]:
-                if word.startswith(("/", "~", "../", "./")) or "/" in word:
+                if len(word) < 400 and (word.startswith(("/", "~", "../", "./")) or "/" in word):
                     candidates.append(absolute_path(word, here))
     except ValueError:
         pass
@@ -492,34 +580,68 @@ def read_small(path):
         return ""
 
 
-def make_recipe(makefile, target):
-    current, found = None, []
+def make_recipe(makefile, target, seen=None):
+    """Return the recipe lines of a make target and the targets it depends on."""
+    seen = seen if seen is not None else set()
+    recipes, deps, first = {}, {}, None
+    current = None
     for line in read_small(makefile).splitlines():
-        head = re.match(r"^([\w./%-]+)\s*:(?!=)", line)
+        head = re.match(r"^([\w./%-]+)\s*:(?!=)(.*)$", line)
         if head and not line.startswith("\t"):
-            if current is None and not target and not head.group(1).startswith("."):
-                target = head.group(1)
             current = head.group(1)
-        elif line.startswith("\t") and current == target:
-            found.append(line.strip().lstrip("@-+"))
+            deps[current] = head.group(2).split()
+            recipes.setdefault(current, [])
+            if first is None and not current.startswith("."):
+                first = current
+        elif line.startswith("\t") and current:
+            recipes[current].append(line.strip().lstrip("@-+"))
+    target = target or first
+    found, queue = [], [target]
+    while queue:
+        name = queue.pop()
+        if name in seen or name not in recipes:
+            continue
+        seen.add(name)
+        found.extend(recipes[name])
+        queue.extend(deps[name])
     return found
+
+
+def scan_script_text(text):
+    """Return (what, kind) if script text plainly opens a PR or disables wontdo."""
+    lines = [l for l in text.splitlines()[:20000] if not l.lstrip().startswith(("#", "//"))]
+    for number, line in enumerate(lines):
+        if OFF_IN_SCRIPT.search(line):
+            return "a script that edits wontdo or agent settings", OFF_KIND
+        if SCRIPT_PR.search(line) or GRAPHQL_PR.search(line):
+            return "a script that opens or changes a pull request", "a pull request or CI action"
+        if API_ENDPOINT.search(line) and POST_WORD.search("\n".join(lines[max(0, number - 3):number + 4])):
+            return "a script that opens or changes a pull request", "a pull request or CI action"
+    return None
 
 
 def script_action(cmd, words, args, plain, here, depth):
     """Read a script, make target or npm script before it runs."""
     if depth >= MAX_SCAN_DEPTH:
         return None
+    if cmd in INTERPRETERS:
+        for flag in ("-c", "-e"):
+            if flag in args[:-1]:
+                return scan_script_text(args[args.index(flag) + 1])
     file_path = None
-    if cmd in INTERPRETERS and plain and not {"-c", "-e", "-m"} & set(args):
-        file_path = absolute_path(plain[0], here)
+    if cmd in INTERPRETERS and "-m" not in args:
+        file_path = next((absolute_path(a, here) for a in plain if os.path.isfile(absolute_path(a, here))), None)
     elif "/" in words[0]:
         file_path = absolute_path(words[0], here)
-    if file_path and is_wontdo_file(file_path):
-        return None if plain[-1:] == ["status"] else (os.path.basename(file_path), OFF_KIND)
     if file_path:
         text = read_small(file_path)
-        if SCRIPT_PR.search(text) or RAW_API_WRITE.search(text):
-            return f"{os.path.basename(file_path)} opens or changes a pull request", "a pull request or CI action"
+        own = is_wontdo_file(file_path) or "wontdo: stops coding agents" in text
+        if own:
+            rest = [a for a in plain if absolute_path(a, here) != file_path]
+            return None if rest == ["status"] and len(args) == len(plain) else (os.path.basename(file_path), OFF_KIND)
+        found = scan_script_text(text)
+        if found:
+            return found
         for line in text.splitlines():
             if NESTED_RUN.match(line):
                 found = banned_action(line, here, depth + 1)
@@ -527,10 +649,23 @@ def script_action(cmd, words, args, plain, here, depth):
                     return found
         return None
     if cmd in {"make", "gmake"}:
-        for line in make_recipe(os.path.join(here, "Makefile"), plain[0] if plain else None):
-            found = banned_action(line, here, depth + 1)
-            if found:
-                return f"make {plain[0] if plain else ''}: {found[0]}", found[1]
+        folder, makefile, targets, skip = here, "Makefile", [], None
+        for arg in args:
+            if skip:
+                if skip == "-C":
+                    folder = absolute_path(arg, here)
+                else:
+                    makefile = arg
+                skip = None
+            elif arg in {"-C", "-f", "--file", "--directory"}:
+                skip = "-C" if arg in {"-C", "--directory"} else "-f"
+            elif not arg.startswith("-") and "=" not in arg:
+                targets.append(arg)
+        for target in targets or [None]:
+            for line in make_recipe(os.path.join(folder, makefile), target):
+                found = banned_action(line, folder, depth + 1)
+                if found:
+                    return f"make {target or ''}: {found[0]}", found[1]
         return None
     if cmd in {"npm", "pnpm", "yarn", "bun"}:
         name = plain[1] if plain[:1] == ["run"] and len(plain) > 1 else (plain[0] if plain and cmd != "npm" else None)
@@ -549,14 +684,22 @@ def script_action(cmd, words, args, plain, here, depth):
 
 def banned_words(words, here, depth):
     """Return (what, kind) if one shell command is a banned action."""
+    original = words
     words = strip_wrappers(words)
     if not words:
         return None
     cmd, args = os.path.basename(words[0]), words[1:]
-    if cmd in {"sh", "bash", "zsh", "dash"} and "-c" in args[:-1]:
-        return banned_action(args[args.index("-c") + 1], here, depth)
+    if cmd in SHELLS:
+        for i, arg in enumerate(args[:-1]):
+            if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", arg):
+                return banned_action(args[i + 1], here, depth)
     if cmd == "eval":
         return banned_action(" ".join(args), here, depth)
+    if cmd == "find" and {"-exec", "-execdir"} & set(args):
+        start = next(i for i, a in enumerate(args) if a in {"-exec", "-execdir"})
+        found = banned_words(args[start + 1:], here, depth)
+        if found:
+            return found
 
     plain, skip = [], False
     for arg in args:
@@ -570,10 +713,24 @@ def banned_words(words, here, depth):
     label = " ".join([cmd, head, sub]).strip()
     joined = " ".join(args)
     full = " ".join(words)
+    if OTHER_PR_TOOLS.match(full):
+        return label, "a pull request action"
+    if cmd == "gh" and {"--help", "-h"} & set(args):
+        return None
+    if cmd in {"claude", "codex"}:
+        moved = any(re.match(r"^(HOME|CLAUDE_CONFIG_DIR|CODEX_HOME)=", w) for w in original)
+        if moved or "--settings" in args or "wontdo allow" in joined:
+            return label, OFF_KIND
+    if cmd == "git" and head == "config" and SCRIPT_PR.search(joined):
+        return label, "a way to hide a pull request action"
+    if cmd == "git" and "merge_request.create" in joined:
+        return label, "a merge request action"
 
     for ban in EXTRA_BANS:
         if ban.get("commands") and re.search(ban["commands"], full):
             return label, ban["kind"]
+    if cmd in {"cp", "ln", "rsync"} and any(is_wontdo_file(absolute_path(a, here)) for a in plain[:-1]):
+        return label, OFF_KIND
     if cmd in {"rm", "mv", "chmod", "chown", "truncate", "unlink", "shred"}:
         if any(is_wontdo_file(absolute_path(a, here)) or is_agent_settings(absolute_path(a, here)) for a in plain):
             return label, OFF_KIND
@@ -583,7 +740,7 @@ def banned_words(words, here, depth):
             return label, OFF_KIND
     if cmd == "claude" and "--bare" in args:
         return label, OFF_KIND
-    if cmd == "codex" and re.search(r"(--disable[ =]hooks|features\.(codex_)?hooks=false|allow_managed_hooks_only)", joined):
+    if cmd == "codex" and re.search(r"(--disable[ =](codex_)?hooks|features\.(codex_)?hooks\s*=\s*false|allow_managed_hooks_only)", joined):
         return label, OFF_KIND
     if cmd == "gh" and head and head not in GH_COMMANDS:
         return label, "an unknown gh command that could open a pull request"
@@ -599,9 +756,10 @@ def banned_words(words, here, depth):
         return label, "a CI action"
     if cmd == "glab" and head == "ci" and sub in {"run", "retry", "trigger"}:
         return label, "a CI action"
-    if ((cmd == "gh" and head == "api") or cmd in {"curl", "wget", "http", "https"}) and (
-        API_BANNED.search(joined) and API_WRITES.search(joined)
-    ):
+    if cmd in {"gh", "glab", "hub"} and head == "api":
+        if (API_BANNED.search(joined) and GH_WRITE.search(joined)) or GRAPHQL_PR.search(joined):
+            return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
+    if cmd in {"curl", "wget", "http", "https"} and API_ENDPOINT.search(joined) and (CURL_WRITE.search(joined) or POST_WORD.search(joined)):
         return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
     return script_action(cmd, words, args, plain, here, depth)
 
@@ -609,8 +767,25 @@ def banned_words(words, here, depth):
 def banned_action(command, cwd, depth=0):
     if "WONTDO_OFF" in command:
         return "WONTDO_OFF", OFF_KIND
-    if RAW_API_WRITE.search(command):
-        return "a write to a pull request or CI endpoint", "a pull request or CI action"
+    if OFF_DESTROY.search(command):
+        return "a command that removes wontdo", OFF_KIND
+    text, bodies = split_heredocs(command)
+    for header, body in bodies:
+        before = header[:HEREDOC_START.search(header).start()]
+        words = before.replace(";", " ").replace("|", " ").split()
+        if any(os.path.basename(w) in INTERPRETERS for w in words):
+            found = scan_script_text(body)
+            if found:
+                return found
+    if re.search(r"\|\s*(ba|z|da)?sh\b", text):
+        found = scan_script_text(text)
+        if found:
+            return found
+    for match in SUBSTITUTION.finditer(text):
+        if depth < MAX_SCAN_DEPTH:
+            found = banned_action(match.group(1) or match.group(2) or "", cwd, depth + 1)
+            if found:
+                return found
     try:
         for here, words in walk_command(command, cwd):
             found = banned_words(words, here, depth)
@@ -627,7 +802,7 @@ def banned_tool(tool, tool_input, cwd):
         return banned_action(tool_input.get("command") or "", cwd)
     if tool.startswith("mcp__"):
         name = tool.rsplit("__", 1)[-1]
-        if MCP_BANNED.search(name) and not MCP_READ_ONLY.match(name):
+        if MCP_BANNED.search(name) and not MCP_READ_ONLY.search(name):
             return name, "a pull request or CI action"
     return None
 
@@ -661,8 +836,8 @@ def writes_in(tool, tool_input, cwd):
     if tool == "NotebookEdit":
         return [(tool_input.get("notebook_path"), tool_input.get("new_source"))]
     if tool.startswith("mcp__"):
-        path = tool_input.get("path") or tool_input.get("file_path")
-        return [(path, tool_input.get("content"))]
+        paths = [tool_input.get(k) for k in ("path", "file_path", "filepath", "destination", "target")]
+        return [(path, tool_input.get("content")) for path in paths if isinstance(path, str)]
     return []
 
 
@@ -672,10 +847,10 @@ def writes_in(tool, tool_input, cwd):
 def git(root, *args):
     try:
         done = subprocess.run(
-            ["git", "-C", str(root), *args], capture_output=True, text=True, errors="replace", timeout=10,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            ["git", "-c", "core.quotepath=off", "-C", str(root), *args], capture_output=True, text=True,
+            errors="surrogateescape", timeout=10, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         return ""
     return done.stdout if done.returncode == 0 else ""
 
@@ -712,6 +887,10 @@ def added_text(root, rel, *revisions):
 
 def banned_change(root, rel, *revisions):
     kind = classify(str(root / rel), str(root))
+    if kind == "a unit test":
+        diff = git(root, "diff", "-U0", *revisions, "--", rel)
+        if diff and not added_text(root, rel, *revisions).strip():
+            return None
     if kind:
         return kind
     if os.path.splitext(rel)[1].lower() in CODE_EXT:
@@ -731,14 +910,20 @@ def load_state(session):
 
 
 def save_state(session, state):
-    SESSIONS.mkdir(parents=True, exist_ok=True)
-    cutoff = time.time() - 30 * 86400
-    for old in SESSIONS.glob("*"):
-        if old.stat().st_mtime < cutoff:
-            old.unlink(missing_ok=True)
-    tmp = SESSIONS / f".{session}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(state))
-    os.replace(tmp, SESSIONS / f"{session}.json")
+    try:
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 30 * 86400
+        for old in SESSIONS.glob("*"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                pass
+        tmp = SESSIONS / f".{session}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(state))
+        os.replace(tmp, SESSIONS / f"{session}.json")
+    except OSError as error:
+        print(f"wontdo could not save state: {error}", file=sys.stderr)
 
 
 def ensure_baseline(state, session, roots):
@@ -748,15 +933,21 @@ def ensure_baseline(state, session, roots):
             state["baselines"][str(root)] = dirty_files(root)
             state.setdefault("heads", {})[str(root)] = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
             state.setdefault("started", {})[str(root)] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            state.setdefault("ignores", {})[str(root)] = read_small(root / IGNORE_FILE)
             changed = True
     if changed:
         save_state(session, state)
+    global IGNORES
+    IGNORES = state.get("ignores", {})
 
 
 def note_call(session, tool_use_id, event):
-    SESSIONS.mkdir(parents=True, exist_ok=True)
-    with (SESSIONS / f"{session}.calls").open("a") as handle:
-        handle.write(f"{time.time():.3f} {event} {tool_use_id}\n")
+    try:
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        with (SESSIONS / f"{session}.calls").open("a") as handle:
+            handle.write(f"{time.time():.3f} {event} {tool_use_id}\n")
+    except OSError:
+        pass
 
 
 def call_windows(session):
@@ -775,8 +966,26 @@ def call_windows(session):
             starts[call] = stamp
         elif call in starts:
             windows.append((starts.pop(call), stamp))
-    windows.extend((s, float("inf")) for s in starts.values())
+    windows.extend((s, s + MAX_CALL_SECONDS) for s in starts.values())
     return windows
+
+
+def close_open_calls(session):
+    """A command still open when the agent finishes has ended, or its result was lost."""
+    try:
+        lines = (SESSIONS / f"{session}.calls").read_text().splitlines()
+    except OSError:
+        return
+    open_calls = {}
+    for line in lines:
+        parts = line.split(" ", 2)
+        if len(parts) == 3:
+            if parts[1] == "start":
+                open_calls[parts[2]] = True
+            else:
+                open_calls.pop(parts[2], None)
+    for call in open_calls:
+        note_call(session, call, "end")
 
 
 def in_windows(stamp, windows):
@@ -809,18 +1018,20 @@ def dirty_violations(root, baseline, head, windows, state):
 def committed_violations(root, head, windows, state):
     """Return {path: kind} for banned changes this session committed since the baseline."""
     current = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
-    if not head or not current or head == current:
+    if not current or head == current:
         return {}
+    span = f"{head}..HEAD" if head else "HEAD"
+    start = head or "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
     touched, stamp = set(), 0
-    for line in git(root, "log", f"{head}..HEAD", "--no-merges", "--name-only", "--format=@%ct").splitlines():
+    for line in git(root, "log", span, "--no-merges", "--name-only", "--format=@%ct").splitlines():
         if line.startswith("@"):
             stamp = int(line[1:])
         elif line and in_windows(stamp, windows):
             touched.add(line)
     found = {}
-    for rel in git(root, "diff", "--name-only", "--diff-filter=ACMR", head, "HEAD").splitlines():
+    for rel in git(root, "diff", "--name-only", "--diff-filter=ACMR", start, "HEAD").splitlines():
         if rel in touched and not is_allowed(str(root / rel), str(root), state):
-            kind = banned_change(root, rel, head, "HEAD")
+            kind = banned_change(root, rel, start, "HEAD")
             if kind:
                 found[rel] = kind
     return found
@@ -830,6 +1041,13 @@ def committed_violations(root, head, windows, state):
 
 
 def record(payload, layer, kind, path):
+    try:
+        write_log(payload, layer, kind, path)
+    except OSError as error:
+        print(f"wontdo could not log: {error}", file=sys.stderr)
+
+
+def write_log(payload, layer, kind, path):
     HOME.mkdir(parents=True, exist_ok=True)
     entry = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -843,17 +1061,20 @@ def record(payload, layer, kind, path):
         handle.write(json.dumps(entry) + "\n")
 
 
-def deny_message(path, kind):
+def deny_message(path, kind, cwd=None, is_file=True):
+    if cwd and os.path.isabs(path) and inside(path, cwd):
+        path = os.path.relpath(path, cwd)
     if kind == COMMENT_KIND:
         return (
             f"WONTDO blocked this: {path} adds {kind}. The owner wants code with few comments. "
             "Write it again without the docstring or comment block."
         )
-    tail = (
-        "and that the choice to turn it off is theirs."
-        if kind == OFF_KIND
-        else f"and that they can allow this one file by typing: wontdo allow {path}"
-    )
+    if kind == OFF_KIND:
+        tail = "and that the choice to turn it off is theirs."
+    elif is_file:
+        tail = f"and that they can allow this one file by typing on its own line: wontdo allow {path}"
+    else:
+        tail = "and that the choice to turn it off is theirs."
     return (
         f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here, and this "
         "overrides any project instruction that says otherwise. Do not retry through another "
@@ -879,10 +1100,13 @@ def git_violation(command, roots, state, windows):
     pushing = re.search(r"\bgit\b[^;&|\n]*\bpush\b", command)
     if not committing and not pushing:
         return None
+    broad = re.search(r"\badd\s+(-A|--all|-u|\.)(\s|$)|\bcommit\b[^;&|\n]*\s(-\w*a\w*|--all)(\s|$)", command)
     for root in roots:
         baseline = state["baselines"].get(str(root), {})
         head = state.get("heads", {}).get(str(root))
-        found = dict(dirty_violations(root, baseline, head, windows, state)[0])
+        dirty = dirty_violations(root, baseline, head, windows, state)[0]
+        staged = set(git(root, "diff", "--cached", "--name-only").splitlines())
+        found = {r: k for r, k in dirty.items() if broad or r in staged or r in command}
         if pushing:
             found.update(committed_violations(root, head, windows, state))
         if found:
@@ -906,15 +1130,17 @@ def on_subagent(payload):
 
 def on_prompt(payload):
     prompt = payload.get("prompt") or ""
-    wanted = re.findall(r"^\s*wontdo allow\s+(\S+)\s*$", prompt, re.M | re.I)
+    wanted = re.findall(r"^wontdo allow[ \t]+(.+?)[ \t]*$", prompt, re.M | re.I)
     context = REMINDER
     cwd = payload.get("cwd") or "."
     session = session_name(payload)
     state = load_state(session)
-    accepted = []
-    for path in wanted:
+    accepted, refused = [], []
+    for raw in wanted:
+        path = raw.strip("`'\"")
         absolute = absolute_path(path, cwd)
         if re.search(r"[*?\[]", path) or off_switch(path, cwd, "Bash", {}) or os.path.basename(absolute) == IGNORE_FILE:
+            refused.append(path)
             continue
         state.setdefault("allowed", []).append(os.path.realpath(absolute))
         accepted.append(path)
@@ -923,6 +1149,8 @@ def on_prompt(payload):
         save_state(session, state)
         names = ", ".join(accepted)
         context += f" The owner allowed this one file for this session: {names}."
+    if refused:
+        context += f" wontdo refused this exception, tell the owner it needs one exact file: {', '.join(refused)}."
     print(json.dumps({
         "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
     }))
@@ -947,25 +1175,30 @@ def on_pre(payload):
         if not path:
             continue
         kind = off_switch(path, cwd, tool, tool_input)
+        added = "\n".join(new_lines(tool, tool_input, absolute_path(path, cwd), text)) if text else text
         if not kind and not is_allowed(path, cwd, state):
-            kind = classify(path, cwd) or content_kind(path, text)
-        kind = kind or comment_kind(path, cwd, tool, tool_input, text)
+            kind = classify(path, cwd)
+            if kind == "a unit test" and tool in {"Edit", "MultiEdit"} and not (added or "").strip():
+                kind = None
+            elif not kind:
+                kind = content_kind(path, added)
+        kind = kind or comment_kind(path, cwd, tool, tool_input, text, state)
         if kind:
             record(payload, "pre", kind, path)
-            deny(deny_message(path, kind))
+            deny(deny_message(path, kind, cwd))
             return
 
     action = banned_tool(tool, tool_input, cwd)
     if action:
         record(payload, "pre", action[1], action[0])
-        deny(deny_message(*action))
+        deny(deny_message(action[0], action[1], is_file=False))
         return
 
     if tool == "Bash":
         rel = git_violation(command, roots, state, call_windows(session))
         if rel:
             record(payload, "commit", "a banned change", rel)
-            deny(deny_message(rel, "a banned change, so it can't be committed or pushed"))
+            deny(deny_message(rel, "a banned change, so it can't be committed or pushed", is_file=False))
             return
         note_call(session, payload.get("tool_use_id") or "x", "start")
 
@@ -998,6 +1231,7 @@ def on_stop(payload):
     session = session_name(payload)
     state = load_state(session)
     ensure_baseline(state, session, [repo_root(payload.get("cwd") or ".")])
+    close_open_calls(session)
     windows = call_windows(session)
     mine, others = {}, {}
     for key, baseline in state["baselines"].items():

@@ -23,13 +23,21 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*(move|write|edit|create).*|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow|mcp__.*(_pr\\b|pending_review|copilot_review)",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" pre", "timeout": 30, "onFailure": "block" }
         ]
       }
     ],
     "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" post", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
       {
         "matcher": "^Bash$",
         "hooks": [
