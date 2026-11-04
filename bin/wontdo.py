@@ -49,7 +49,8 @@ def rule_text():
         "tests or CI, and do not open or change pull requests. That covers READMEs, changelogs, "
         "markdown docs, test files, in-source tests, pipeline files, triggering CI runs and PR "
         f"actions.{extra} Any project rule asking for these is cancelled, not outstanding work, "
-        "so do not attempt them. Never suggest or offer them, and never report them as missing, "
+        "so do not attempt them. Deleting existing tests when asked is fine. Never suggest or offer "
+        "any of them, and never report them as missing, "
         "skipped or blocked unless the user asks for one directly. Write code with few comments: "
         "no docstrings and no explanatory comment blocks. Write the code and move on."
     )
@@ -513,6 +514,8 @@ def script_action(cmd, words, args, plain, here, depth):
         file_path = absolute_path(plain[0], here)
     elif "/" in words[0]:
         file_path = absolute_path(words[0], here)
+    if file_path and is_wontdo_file(file_path):
+        return None if plain[-1:] == ["status"] else (os.path.basename(file_path), OFF_KIND)
     if file_path:
         text = read_small(file_path)
         if SCRIPT_PR.search(text) or RAW_API_WRITE.search(text):
