@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -533,6 +534,7 @@ def ensure_baseline(payload):
     if str(root) not in state["baselines"]:
         state["baselines"][str(root)] = dirty_files(root)
         state.setdefault("heads", {})[str(root)] = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
+        state.setdefault("started", {})[str(root)] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         save_state(session, state)
     return session, state
 
@@ -587,6 +589,25 @@ def git_violation(command, root, baseline, head):
     return None
 
 
+def new_prs(root, state):
+    """Return URLs of PRs opened with this account since the session began, once each."""
+    started = state.get("started", {}).get(str(root))
+    if not started or not shutil.which("gh"):
+        return []
+    try:
+        done = subprocess.run(
+            ["gh", "pr", "list", "--author", "@me", "--state", "all", "--limit", "20", "--json", "url,createdAt"],
+            cwd=root, capture_output=True, text=True, timeout=8,
+        )
+        pulls = json.loads(done.stdout) if done.returncode == 0 else []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    seen = state.setdefault("seen_prs", [])
+    urls = [p["url"] for p in pulls if p.get("createdAt", "") >= started and p["url"] not in seen]
+    seen.extend(urls)
+    return urls
+
+
 def on_session(payload):
     ensure_baseline(payload)
     print(json.dumps({
@@ -634,16 +655,22 @@ def on_stop(payload):
     head = state.get("heads", {}).get(str(root))
     found = {**dirty_violations(root, baseline, head), **committed_violations(root, head)}
     changed = sorted(found)
-    if not changed:
-        if state.get("stop_blocks"):
-            state["stop_blocks"] = 0
-            save_state(session, state)
-        return
-
     listing = ", ".join(changed)
-    if state.get("stop_blocks", 0) >= STOP_BLOCK_LIMIT:
-        record(payload, "gave-up", "unremoved", listing)
-        print(json.dumps({"systemMessage": f"WONTDO: agent left these behind, review them: {listing}"}))
+    if not changed or state.get("stop_blocks", 0) >= STOP_BLOCK_LIMIT:
+        notes = []
+        if changed:
+            record(payload, "gave-up", "unremoved", listing)
+            notes.append(f"agent left these behind, review them: {listing}")
+        else:
+            state["stop_blocks"] = 0
+        urls = new_prs(root, state)
+        for url in urls:
+            record(payload, "noticed", "a pull request", url)
+        if urls:
+            notes.append("a pull request was opened during this session: " + ", ".join(urls))
+        save_state(session, state)
+        if notes:
+            print(json.dumps({"systemMessage": "WONTDO: " + "; ".join(notes)}))
         return
 
     state["stop_blocks"] = state.get("stop_blocks", 0) + 1
