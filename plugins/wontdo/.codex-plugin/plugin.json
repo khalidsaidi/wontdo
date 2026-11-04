@@ -1,6 +1,6 @@
 {
   "name": "wontdo",
-  "version": "0.6.0",
-  "description": "Ban what agents do, repo by repo: wontdo ban all, wontdo ban ci, wontdo allow tests.",
+  "version": "0.6.1",
+  "description": "Ban what agents do, repo by repo: docs, tests, CI and PRs.",
   "skills": "./codex/skills/"
 }
