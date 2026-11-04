@@ -7,11 +7,40 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" subagent", "timeout": 10 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" prompt", "timeout": 10 }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" pre", "timeout": 30, "onFailure": "block" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" post", "timeout": 10 }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" stop", "timeout": 60 }
         ]
       }
     ],
