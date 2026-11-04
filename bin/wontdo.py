@@ -393,7 +393,9 @@ def deny_message(path, kind):
         f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here. "
         "Do not retry through another tool, script, file name or location. "
         "Drop this part of the work and carry on with the code. If the user "
-        "explicitly asked for it, tell them wontdo blocked it; only they can turn it off."
+        "explicitly asked for it, tell them wontdo blocked it. Only they can turn it off: "
+        "in Claude with /plugin disable wontdo@wontdo, in Codex with "
+        "codex plugin remove wontdo@wontdo."
     )
 
 
