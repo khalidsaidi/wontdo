@@ -1,11 +1,13 @@
 {
   "name": "wontdo",
   "description": "Things agents won't do.",
-  "owner": { "name": "khalidsaidi" },
+  "owner": {
+    "name": "khalidsaidi"
+  },
   "plugins": [
     {
       "name": "wontdo",
-      "source": "./",
+      "source": "./plugins/wontdo",
       "description": "Looks over the agent's shoulder: no docs, no unit tests, no CI, no PRs."
     }
   ]

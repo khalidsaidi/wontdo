@@ -1,11 +1,19 @@
 {
   "name": "wontdo",
-  "interface": { "displayName": "wontdo" },
+  "interface": {
+    "displayName": "wontdo"
+  },
   "plugins": [
     {
       "name": "wontdo",
-      "source": { "source": "local", "path": "./" },
-      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "source": {
+        "source": "local",
+        "path": "./plugins/wontdo"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
       "category": "Productivity"
     }
   ]
