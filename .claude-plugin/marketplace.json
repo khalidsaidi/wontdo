@@ -8,7 +8,7 @@
     {
       "name": "wontdo",
       "source": "./plugins/wontdo",
-      "description": "Looks over the agent's shoulder: no docs, no unit tests, no CI, no PRs."
+      "description": "Ban what agents do, repo by repo: wontdo ban all, wontdo ban ci, wontdo allow tests."
     }
   ]
 }

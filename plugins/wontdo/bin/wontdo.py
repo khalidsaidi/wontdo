@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
-"""wontdo: stops coding agents writing docs, unit tests or CI, or touching PRs.
+"""wontdo: lets the owner ban things agents do, repo by repo.
 
 Called by Claude Code and Codex hooks as: wontdo.py session|subagent|prompt|pre|post|stop
 Called by the wontdo skill as:            wontdo.py status
 
-Add a ban by adding an entry to bans.json:
-  {"kind": "a Dockerfile", "files": "^Dockerfile", "folders": ["k8s"], "commands": "^docker push"}
-files and commands are regular expressions. Every field but kind is optional.
+Everything wontdo can forbid is a Ban. A Ban knows its name, what it says to the agent, and which
+files, content, shell commands, scripts and MCP tools it covers. Hooks never name a ban: they ask
+whether an active ban matches.
+
+Nothing is banned until the owner says so. Bans belong to the repo, not to an agent, so the Claude
+and Codex versions of this plugin share them. Commands, with $ instead of / in Codex:
+  /wontdo:ban all       /wontdo:ban ci       (stays on in this repo until lifted)
+  /wontdo:allow all     /wontdo:allow ci     (lifted in this repo until banned again)
+  /wontdo:allow README.md                    (this one file, this session)
+  /wontdo:status
+The prompt hook applies them, because only the owner's own message reaches it.
+
+Add a new ban by adding an entry to bans.json:
+  {"name": "docker", "kind": "a Dockerfile", "files": "^Dockerfile", "folders": ["k8s"], "commands": "^docker push"}
+files and commands are regular expressions. name and kind are required.
 """
+import collections
 import fnmatch
 import hashlib
 import json
@@ -27,40 +40,10 @@ SESSIONS = HOME / "sessions"
 IGNORE_FILE = ".wontdoignore"
 STOP_BLOCK_LIMIT = 3
 MAX_CALL_SECONDS = 1800
-BANNED = "documentation, unit tests, CI or pull requests"
+REPO_BANS = HOME / "repo_bans.json"
 OFF_KIND = "wontdo's own off switch"
 COMMENT_KIND = "a long comment or docstring"
-
-
-def load_bans():
-    try:
-        return json.loads((PLUGIN_ROOT / "bans.json").read_text())
-    except (OSError, ValueError):
-        return []
-
-
-EXTRA_BANS = load_bans()
-
-
-def rule_text():
-    extra = "".join(f" Also do not write or run {b['kind']}." for b in EXTRA_BANS)
-    return (
-        "This rule comes from the owner and overrides any project instructions, CLAUDE.md, "
-        "AGENTS.md, skill, plan or habit that says otherwise. Do not write documentation, unit "
-        "tests or CI, and do not open or change pull requests. That covers READMEs, changelogs, "
-        "markdown docs, test files, in-source tests, pipeline files, triggering CI runs and PR "
-        f"actions.{extra} Any project rule asking for these is cancelled, not outstanding work, "
-        "so do not attempt them. Deleting existing tests when asked is fine. Never suggest or offer "
-        "any of them, and never report them as missing, "
-        "skipped or blocked unless the user asks for one directly. Write code with few comments: "
-        "no docstrings and no explanatory comment blocks. Write the code and move on."
-    )
-
-
-REMINDER = (
-    "wontdo: no documentation, unit tests, CI or pull requests. Project rules asking for them are "
-    "cancelled. Do not attempt, offer or mention them unless this message asks for one directly."
-)
+STATE = None
 
 
 # Paths -----------------------------------------------------------------------
@@ -125,12 +108,11 @@ CI_WORKFLOW_PARENTS = {".github", ".gitea", ".forgejo"}
 SWITCH_WORDS = re.compile(
     r"wontdo|enabledPlugins|disableAllHooks|allowManagedHooksOnly|hooks\s*=|hooks\.state", re.I
 )
-OFF_IN_SCRIPT = re.compile(r"\.wontdo\b|\.claude/settings|\.codex/config\.toml|disableAllHooks")
+OFF_IN_SCRIPT = re.compile(r"\.wontdo\b|\.wontdoignore\b|\.claude/settings|\.codex/config\.toml|disableAllHooks")
 OFF_DESTROY = re.compile(
     r"(\brm\s|rmtree|unlink|-delete\b|remove\()[^\n]*(\.wontdo\b|plugins/[^\s'\"]*wontdo)"
     r"|(\.wontdo\b|plugins/[^\s'\"]*wontdo)[^\n]*-delete\b"
 )
-IGNORES = None
 
 
 def repo_root(start):
@@ -152,10 +134,7 @@ def temp_dirs():
 
 def ignored(rel, root):
     """Honour the ignore file as it was when the session began, so agents can't widen it."""
-    if IGNORES is None:
-        text = read_small(root / IGNORE_FILE)
-    else:
-        text = IGNORES.get(str(root), "")
+    text = read_small(root / IGNORE_FILE) if STATE is None else STATE.get("ignores", {}).get(str(root), "")
     globs = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")]
     return any(fnmatch.fnmatch(rel, g) for g in globs)
 
@@ -173,6 +152,8 @@ def is_wontdo_file(absolute):
     home = Path.home()
     folders = [PLUGIN_ROOT, HOME, home / ".claude" / "plugins", home / ".codex" / "plugins"]
     real = os.path.realpath(absolute)
+    if os.path.basename(absolute) == IGNORE_FILE:
+        return True
     return any(inside(absolute, f) or inside(real, os.path.realpath(f)) for f in folders)
 
 
@@ -215,16 +196,6 @@ def off_switch(path, cwd, tool, tool_input):
     return None
 
 
-def extra_kind(rel_parts):
-    dirs, name = rel_parts[:-1], rel_parts[-1]
-    for ban in EXTRA_BANS:
-        if ban.get("files") and re.search(ban["files"], name):
-            return ban["kind"]
-        if set(ban.get("folders", [])) & set(dirs):
-            return ban["kind"]
-    return None
-
-
 def test_kind(dirs, name, ext):
     if any(E2E_DIR.search(d) for d in dirs) or E2E_NAME.search(name):
         return None
@@ -260,7 +231,7 @@ def doc_kind(dirs, name, stem, ext, in_repo):
 
 
 def classify(path, cwd):
-    """Return what kind of banned file a path is, or None."""
+    """Return the active Ban that covers a path, or None."""
     absolute = os.path.realpath(absolute_path(path, cwd))
     root = repo_root(os.path.dirname(absolute))
     if root:
@@ -274,23 +245,16 @@ def classify(path, cwd):
     dirs, name = parts[:-1], parts[-1]
 
     if name == IGNORE_FILE:
-        return "wontdo config"
+        return CONFIG if active_bans(root) else None
     if set(dirs) & (AGENT_DIRS | THIRD_PARTY_DIRS):
         return None
     if root and ignored(rel, root):
         return None
-    kind = extra_kind(parts)
-    if kind:
-        return kind
-    in_workflows = any(
-        a in CI_WORKFLOW_PARENTS and b in {"workflows", "actions"} for a, b in zip(dirs, dirs[1:])
-    )
-    ci_name = re.sub(r"\.yaml$", ".yml", name.lower())
-    in_gitlab_ci = any(a == ".gitlab" and b == "ci" for a, b in zip(dirs, dirs[1:]))
-    if in_workflows or in_gitlab_ci or set(dirs) & CI_DIRS or ci_name in CI_FILES or re.match(r"^(jenkinsfile(\.|$)|azure-pipelines-)", ci_name):
-        return "CI config"
     stem, ext = os.path.splitext(name)
-    return test_kind(dirs, name, ext) or doc_kind(dirs, name, stem, ext, bool(root))
+    for ban in active_bans(root):
+        if ban.file(dirs, name, stem, ext, bool(root)):
+            return ban
+    return None
 
 
 # File content ----------------------------------------------------------------
@@ -313,13 +277,18 @@ LONG_COMMENT_LINES = 6
 LONG_DOCSTRING_LINES = 4
 
 
-def content_kind(path, text):
+def looks_like_test(path, text):
     if not text or os.path.splitext(path)[1].lower() not in TEST_CODE_EXT:
-        return None
+        return False
     if any(E2E_DIR.search(d) for d in path.split("/")[:-1]) or E2E_NAME.search(path):
-        return None
-    if IN_SOURCE_TEST.search(text) or (PY_TEST_DEF.search(text) and PY_ASSERT.search(text)):
-        return "a unit test"
+        return False
+    return bool(IN_SOURCE_TEST.search(text) or (PY_TEST_DEF.search(text) and PY_ASSERT.search(text)))
+
+
+def content_ban(path, text, root):
+    for ban in active_bans(root):
+        if ban.content(path, text):
+            return ban
     return None
 
 
@@ -383,6 +352,8 @@ def comment_kind(path, cwd, tool, tool_input, text, state):
     if not text or ext not in TEST_CODE_EXT or is_allowed(path, cwd, state):
         return None
     absolute = os.path.realpath(absolute_path(path, cwd))
+    if DOCS not in active_bans(repo_root(os.path.dirname(absolute))):
+        return None
     if set(absolute.split("/")[:-1]) & THIRD_PARTY_DIRS or any(inside(absolute, d) for d in temp_dirs()) and not repo_root(os.path.dirname(absolute)):
         return None
     lines = new_lines(tool, tool_input, absolute_path(path, cwd), text)
@@ -403,11 +374,7 @@ SCRIPT_WRITES = [
 ]
 PR_READ_ONLY = {"view", "list", "diff", "checks", "status", "checkout"}
 MCP_READ_ONLY = re.compile(r"^(get|list|search|read|view)|_(get|list|search|read|view)$", re.I)
-MCP_BANNED = re.compile(r"(pull_?request|merge_?request|workflow|_pr\b|^create_pr|pending_review|request_copilot_review)", re.I)
-API_BANNED = re.compile(r"/pulls\b|/merge_requests\b|/dispatches\b|/rerun\b|\b(createPullRequest|mergePullRequest)\b")
-API_ENDPOINT = re.compile(
-    r"(api\.github\.com|\brepos/[^\s/'\"]+/[^\s/'\"]+/|gitlab\.[\w.]+/api|\bprojects/[^\s/'\"]+/)[^\s'\"]*(pulls\b|/merge_requests\b|/dispatches\b|/rerun\b)"
-)
+API_HOST = r"(api\.github\.com|\brepos/[^\s/'\"]+/[^\s/'\"]+/|gitlab\.[\w.]+/api|\bprojects/[^\s/'\"]+/)[^\s'\"]*"
 GRAPHQL_PR = re.compile(r"\b(create|merge|close|update|reopen)PullRequest\b|enablePullRequestAutoMerge|addPullRequestReview")
 POST_WORD = re.compile(r"\.post\(|--post|--json|method\W{1,4}POST|-X\s*POST|[\"']POST[\"']")
 GH_COMMANDS = {
@@ -422,9 +389,11 @@ OTHER_PR_TOOLS = re.compile(r"^(az repos pr (create|update)|tea (pulls?|pr) (cre
 SCRIPT_PR = re.compile(
     r"\bgh\s+(-R\s+\S+\s+|--repo[ =]\S+\s+)?pr\s+(create|merge|close|edit|reopen|ready|comment|review)\b"
     r"|['\"]gh['\"]\s*,\s*['\"]pr['\"]\s*,\s*['\"](create|merge|close|edit|reopen|ready|comment|review)['\"]"
-    r"|\bgh\s+workflow\s+(run|enable)\b|\bgh\s+run\s+rerun\b"
-    r"|\bhub\s+pull-request\b|\bglab\s+mr\s+(create|merge|update|close)\b|\bglab\s+ci\s+(run|retry|trigger)\b"
+    r"|\bhub\s+pull-request\b|\bglab\s+mr\s+(create|merge|update|close)\b"
     r"|\.pulls\.create\b|\.create_pull\b"
+)
+SCRIPT_CI = re.compile(
+    r"\bgh\s+workflow\s+(run|enable)\b|\bgh\s+run\s+rerun\b|\bglab\s+ci\s+(run|retry|trigger)\b"
 )
 SHELLS = {"bash", "sh", "zsh", "dash"}
 INTERPRETERS = SHELLS | {"python", "python3", "node", "ruby", "perl", "deno", "bun", "tsx", "ts-node", "source", "."}
@@ -607,16 +576,19 @@ def make_recipe(makefile, target, seen=None):
     return found
 
 
-def scan_script_text(text):
-    """Return (what, kind) if script text plainly opens a PR or disables wontdo."""
+def scan_script_text(text, here):
+    """Return (what, kind, ban name) if script text plainly does something an active ban covers."""
+    active = active_bans(repo_root(here))
     lines = [l for l in text.splitlines()[:20000] if not l.lstrip().startswith(("#", "//"))]
     for number, line in enumerate(lines):
         if OFF_IN_SCRIPT.search(line):
-            return "a script that edits wontdo or agent settings", OFF_KIND
-        if SCRIPT_PR.search(line) or GRAPHQL_PR.search(line):
-            return "a script that opens or changes a pull request", "a pull request or CI action"
-        if API_ENDPOINT.search(line) and POST_WORD.search("\n".join(lines[max(0, number - 3):number + 4])):
-            return "a script that opens or changes a pull request", "a pull request or CI action"
+            return "a script that edits wontdo or agent settings", OFF_KIND, None
+        nearby = None
+        for ban in active:
+            if nearby is None:
+                nearby = "\n".join(lines[max(0, number - 3):number + 4])
+            if ban.script(line, nearby):
+                return f"a script doing {ban.kind}", ban.kind, ban.name
     return None
 
 
@@ -627,7 +599,7 @@ def script_action(cmd, words, args, plain, here, depth):
     if cmd in INTERPRETERS:
         for flag in ("-c", "-e"):
             if flag in args[:-1]:
-                return scan_script_text(args[args.index(flag) + 1])
+                return scan_script_text(args[args.index(flag) + 1], here)
     file_path = None
     if cmd in INTERPRETERS and "-m" not in args:
         file_path = next((absolute_path(a, here) for a in plain if os.path.isfile(absolute_path(a, here))), None)
@@ -638,8 +610,8 @@ def script_action(cmd, words, args, plain, here, depth):
         own = is_wontdo_file(file_path) or "wontdo: stops coding agents" in text
         if own:
             rest = [a for a in plain if absolute_path(a, here) != file_path]
-            return None if rest == ["status"] and len(args) == len(plain) else (os.path.basename(file_path), OFF_KIND)
-        found = scan_script_text(text)
+            return None if rest == ["status"] and len(args) == len(plain) else (os.path.basename(file_path), OFF_KIND, None)
+        found = scan_script_text(text, here)
         if found:
             return found
         for line in text.splitlines():
@@ -665,7 +637,7 @@ def script_action(cmd, words, args, plain, here, depth):
             for line in make_recipe(os.path.join(folder, makefile), target):
                 found = banned_action(line, folder, depth + 1)
                 if found:
-                    return f"make {target or ''}: {found[0]}", found[1]
+                    return f"make {target or ''}: {found[0]}", found[1], found[2]
         return None
     if cmd in {"npm", "pnpm", "yarn", "bun"}:
         name = plain[1] if plain[:1] == ["run"] and len(plain) > 1 else (plain[0] if plain and cmd != "npm" else None)
@@ -678,12 +650,12 @@ def script_action(cmd, words, args, plain, here, depth):
         if name in scripts:
             found = banned_action(scripts[name], here, depth + 1)
             if found:
-                return f"{cmd} run {name}: {found[0]}", found[1]
+                return f"{cmd} run {name}: {found[0]}", found[1], found[2]
     return None
 
 
 def banned_words(words, here, depth):
-    """Return (what, kind) if one shell command is a banned action."""
+    """Return (what, kind, ban name) if one shell command is covered by an active ban."""
     original = words
     words = strip_wrappers(words)
     if not words:
@@ -713,72 +685,51 @@ def banned_words(words, here, depth):
     label = " ".join([cmd, head, sub]).strip()
     joined = " ".join(args)
     full = " ".join(words)
-    if OTHER_PR_TOOLS.match(full):
-        return label, "a pull request action"
     if cmd == "gh" and {"--help", "-h"} & set(args):
         return None
     if cmd in {"claude", "codex"}:
         moved = any(re.match(r"^(HOME|CLAUDE_CONFIG_DIR|CODEX_HOME)=", w) for w in original)
-        if moved or "--settings" in args or "wontdo allow" in joined:
-            return label, OFF_KIND
-    if cmd == "git" and head == "config" and SCRIPT_PR.search(joined):
-        return label, "a way to hide a pull request action"
-    if cmd == "git" and "merge_request.create" in joined:
-        return label, "a merge request action"
-
-    for ban in EXTRA_BANS:
-        if ban.get("commands") and re.search(ban["commands"], full):
-            return label, ban["kind"]
+        if moved or "--settings" in args:
+            return label, OFF_KIND, None
     if cmd in {"cp", "ln", "rsync"} and any(is_wontdo_file(absolute_path(a, here)) for a in plain[:-1]):
-        return label, OFF_KIND
+        return label, OFF_KIND, None
     if cmd in {"rm", "mv", "chmod", "chown", "truncate", "unlink", "shred"}:
         if any(is_wontdo_file(absolute_path(a, here)) or is_agent_settings(absolute_path(a, here)) for a in plain):
-            return label, OFF_KIND
+            return label, OFF_KIND, None
     if cmd in {"claude", "codex"} and "plugin" in plain:
         removing = {"disable", "uninstall", "remove", "rm"} & set(plain)
         if removing and ("wontdo" in joined or "--all" in args or "-a" in args):
-            return label, OFF_KIND
+            return label, OFF_KIND, None
     if cmd == "claude" and "--bare" in args:
-        return label, OFF_KIND
+        return label, OFF_KIND, None
     if cmd == "codex" and re.search(r"(--disable[ =](codex_)?hooks|features\.(codex_)?hooks\s*=\s*false|allow_managed_hooks_only)", joined):
-        return label, OFF_KIND
-    if cmd == "gh" and head and head not in GH_COMMANDS:
-        return label, "an unknown gh command that could open a pull request"
-    if cmd == "gh" and ((head == "alias" and sub in {"set", "import"}) or (head == "extension" and sub in {"install", "exec", "create"})):
-        return label, "a way to hide a pull request action"
-    if cmd == "gh" and head == "pr" and sub not in PR_READ_ONLY:
-        return label, "a pull request action"
-    if cmd == "glab" and head == "mr" and sub not in PR_READ_ONLY:
-        return label, "a merge request action"
-    if cmd == "hub" and head == "pull-request":
-        return label, "a pull request action"
-    if cmd == "gh" and ((head == "workflow" and sub in {"run", "enable"}) or (head == "run" and sub == "rerun")):
-        return label, "a CI action"
-    if cmd == "glab" and head == "ci" and sub in {"run", "retry", "trigger"}:
-        return label, "a CI action"
-    if cmd in {"gh", "glab", "hub"} and head == "api":
-        if (API_BANNED.search(joined) and GH_WRITE.search(joined)) or GRAPHQL_PR.search(joined):
-            return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
-    if cmd in {"curl", "wget", "http", "https"} and API_ENDPOINT.search(joined) and (CURL_WRITE.search(joined) or POST_WORD.search(joined)):
-        return f"{cmd} write to a pull request or CI endpoint", "a pull request or CI action"
+        return label, OFF_KIND, None
+
+    shell = Shell(cmd, args, plain, head, sub, joined, full, label)
+    for ban in active_bans(repo_root(here)):
+        hit = ban.command(shell)
+        if hit:
+            return hit, ban.kind, ban.name
     return script_action(cmd, words, args, plain, here, depth)
 
 
 def banned_action(command, cwd, depth=0):
     if "WONTDO_OFF" in command:
-        return "WONTDO_OFF", OFF_KIND
+        return "WONTDO_OFF", OFF_KIND, None
+    if re.search(r"wontdo:(allow|ban)\b", command) and re.search(r"\b(claude|codex)\b", command):
+        return "a child agent told to change wontdo", OFF_KIND, None
     if OFF_DESTROY.search(command):
-        return "a command that removes wontdo", OFF_KIND
+        return "a command that removes wontdo", OFF_KIND, None
     text, bodies = split_heredocs(command)
     for header, body in bodies:
         before = header[:HEREDOC_START.search(header).start()]
         words = before.replace(";", " ").replace("|", " ").split()
         if any(os.path.basename(w) in INTERPRETERS for w in words):
-            found = scan_script_text(body)
+            found = scan_script_text(body, cwd)
             if found:
                 return found
     if re.search(r"\|\s*(ba|z|da)?sh\b", text):
-        found = scan_script_text(text)
+        found = scan_script_text(text, cwd)
         if found:
             return found
     for match in SUBSTITUTION.finditer(text):
@@ -792,8 +743,7 @@ def banned_action(command, cwd, depth=0):
             if found:
                 return found
     except ValueError:
-        match = re.search(r"\b(gh\s+pr\s+(?!view|list|diff|checks|status|checkout)\w+|gh\s+workflow\s+run|hub\s+pull-request)", command)
-        return (match.group(1), "a pull request or CI action") if match else None
+        return scan_script_text(command, cwd)
     return None
 
 
@@ -802,8 +752,10 @@ def banned_tool(tool, tool_input, cwd):
         return banned_action(tool_input.get("command") or "", cwd)
     if tool.startswith("mcp__"):
         name = tool.rsplit("__", 1)[-1]
-        if MCP_BANNED.search(name) and not MCP_READ_ONLY.search(name):
-            return name, "a pull request or CI action"
+        if not MCP_READ_ONLY.search(name):
+            for ban in active_bans(repo_root(cwd)):
+                if ban.mcp(name):
+                    return name, ban.kind, ban.name
     return None
 
 
@@ -839,6 +791,219 @@ def writes_in(tool, tool_input, cwd):
         paths = [tool_input.get(k) for k in ("path", "file_path", "filepath", "destination", "target")]
         return [(path, tool_input.get("content")) for path in paths if isinstance(path, str)]
     return []
+
+
+# Bans ------------------------------------------------------------------------
+
+Shell = collections.namedtuple("Shell", "cmd args plain head sub joined full label")
+
+
+class Ban:
+    """One thing agents won't do. Subclasses say what it covers; hooks only use this interface."""
+
+    name = ""
+    kind = ""
+    rule = ""
+    removals_ok = False
+
+    def file(self, dirs, name, stem, ext, in_repo):
+        return False
+
+    def content(self, path, text):
+        return False
+
+    def command(self, shell):
+        return None
+
+    def script(self, line, nearby):
+        return False
+
+    def mcp(self, name):
+        return False
+
+
+class Docs(Ban):
+    name, kind = "docs", "documentation"
+    rule = "write documentation, such as READMEs, changelogs and markdown docs"
+
+    def file(self, dirs, name, stem, ext, in_repo):
+        return bool(doc_kind(dirs, name, stem, ext, in_repo))
+
+
+class Tests(Ban):
+    name, kind = "tests", "a unit test"
+    rule = "write unit tests, such as test files and in-source tests (deleting existing tests when asked is fine)"
+    removals_ok = True
+
+    def file(self, dirs, name, stem, ext, in_repo):
+        return bool(test_kind(dirs, name, ext))
+
+    def content(self, path, text):
+        return looks_like_test(path, text)
+
+
+def is_api_write(shell, tail):
+    """Is this shell command a write to a hosted git API path ending in tail?"""
+    if shell.cmd in {"gh", "glab", "hub"} and shell.head == "api":
+        return bool(re.search(tail, shell.joined) and GH_WRITE.search(shell.joined))
+    if shell.cmd in {"curl", "wget", "http", "https"}:
+        return bool(re.search(API_HOST + tail, shell.joined) and (CURL_WRITE.search(shell.joined) or POST_WORD.search(shell.joined)))
+    return False
+
+
+class Ci(Ban):
+    name, kind = "ci", "a CI change"
+    rule = "write CI config or trigger CI runs"
+    API_TAIL = r"(/dispatches\b|/rerun\b)"
+
+    def file(self, dirs, name, stem, ext, in_repo):
+        pairs = list(zip(dirs, dirs[1:]))
+        in_workflows = any(a in CI_WORKFLOW_PARENTS and b in {"workflows", "actions"} for a, b in pairs)
+        in_gitlab_ci = any(a == ".gitlab" and b == "ci" for a, b in pairs)
+        ci_name = re.sub(r"\.yaml$", ".yml", name.lower())
+        return bool(
+            in_workflows or in_gitlab_ci or set(dirs) & CI_DIRS or ci_name in CI_FILES
+            or re.match(r"^(jenkinsfile(\.|$)|azure-pipelines-)", ci_name)
+        )
+
+    def command(self, s):
+        if s.cmd == "gh" and ((s.head == "workflow" and s.sub in {"run", "enable"}) or (s.head == "run" and s.sub == "rerun")):
+            return s.label
+        if s.cmd == "glab" and s.head == "ci" and s.sub in {"run", "retry", "trigger"}:
+            return s.label
+        if s.cmd == "git" and s.head == "config" and SCRIPT_CI.search(s.joined):
+            return s.label
+        return f"{s.cmd} write to a CI endpoint" if is_api_write(s, self.API_TAIL) else None
+
+    def script(self, line, nearby):
+        if SCRIPT_CI.search(line):
+            return True
+        return bool(re.search(API_HOST + self.API_TAIL, line) and POST_WORD.search(nearby))
+
+    def mcp(self, name):
+        return bool(re.search(r"workflow", name, re.I))
+
+
+class Prs(Ban):
+    name, kind = "prs", "a pull request action"
+    rule = "open or change pull requests"
+    API_TAIL = r"(pulls\b|/merge_requests\b)"
+
+    def command(self, s):
+        if OTHER_PR_TOOLS.match(s.full):
+            return s.label
+        if s.cmd == "git" and ("merge_request.create" in s.joined or (s.head == "config" and SCRIPT_PR.search(s.joined))):
+            return s.label
+        if s.cmd == "gh" and s.head and s.head not in GH_COMMANDS:
+            return s.label
+        if s.cmd == "gh" and ((s.head == "alias" and s.sub in {"set", "import"}) or (s.head == "extension" and s.sub in {"install", "exec", "create"})):
+            return s.label
+        if s.cmd == "gh" and s.head == "pr" and s.sub not in PR_READ_ONLY:
+            return s.label
+        if s.cmd == "glab" and s.head == "mr" and s.sub not in PR_READ_ONLY:
+            return s.label
+        if s.cmd == "hub" and s.head == "pull-request":
+            return s.label
+        if s.cmd in {"gh", "glab", "hub"} and s.head == "api" and GRAPHQL_PR.search(s.joined):
+            return f"{s.cmd} write to a pull request endpoint"
+        return f"{s.cmd} write to a pull request endpoint" if is_api_write(s, self.API_TAIL) else None
+
+    def script(self, line, nearby):
+        if SCRIPT_PR.search(line) or GRAPHQL_PR.search(line):
+            return True
+        return bool(re.search(API_HOST + self.API_TAIL, line) and POST_WORD.search(nearby))
+
+    def mcp(self, name):
+        return bool(re.search(r"pull_?request|merge_?request|_pr\b|^create_pr|pending_review|request_copilot_review", name, re.I))
+
+
+class ListedBan(Ban):
+    """A ban declared as one entry in bans.json."""
+
+    def __init__(self, entry):
+        self.name = entry["name"].lower()
+        self.kind = entry["kind"]
+        self.rule = f"write or run {self.kind}"
+        self.files = entry.get("files")
+        self.folders = set(entry.get("folders", []))
+        self.commands = entry.get("commands")
+
+    def file(self, dirs, name, stem, ext, in_repo):
+        return bool((self.files and re.search(self.files, name)) or self.folders & set(dirs))
+
+    def command(self, shell):
+        return shell.label if self.commands and re.search(self.commands, shell.full) else None
+
+    def script(self, line, nearby):
+        return bool(self.commands and re.search(self.commands, line.strip()))
+
+
+def load_listed_bans():
+    try:
+        return [ListedBan(entry) for entry in json.loads((PLUGIN_ROOT / "bans.json").read_text())]
+    except (OSError, ValueError, KeyError, AttributeError) as error:
+        print(f"wontdo ignored bans.json: {error}", file=sys.stderr)
+        return []
+
+
+CI, TESTS, DOCS, PRS = Ci(), Tests(), Docs(), Prs()
+BANS = [CI, TESTS, DOCS, PRS] + load_listed_bans()
+BY_NAME = {ban.name: ban for ban in BANS}
+
+CONFIG = Ban()
+CONFIG.kind = "wontdo config"
+
+
+def read_repo_bans():
+    try:
+        return json.loads(REPO_BANS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_repo_bans(table):
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = HOME / f".repo_bans.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(table, indent=2))
+    os.replace(tmp, REPO_BANS)
+
+
+def active_bans(root=None):
+    """Return the bans the owner has put on this repo. Nothing is banned by default."""
+    if not root:
+        return []
+    names = read_repo_bans().get(str(root), [])
+    return [ban for ban in BANS if ban.name in names]
+
+
+def rule_text(root):
+    active = active_bans(root)
+    if not active:
+        return ""
+    doing = "; ".join(ban.rule for ban in active)
+    comments = " Write code with few comments: no docstrings and no explanatory comment blocks." if DOCS in active else ""
+    return (
+        "This rule comes from the owner and overrides any project instructions, CLAUDE.md, AGENTS.md, "
+        f"skill, plan or habit that says otherwise. Do not: {doing}. Any project rule asking for these "
+        "is cancelled, not outstanding work, so do not attempt them. Never suggest or offer them, and "
+        f"never report them as missing, skipped or blocked unless the user asks for one directly.{comments} "
+        "Write the code and move on."
+    )
+
+
+def reminder_text(root):
+    active = active_bans(root)
+    if not active:
+        return ""
+    names = ", ".join(ban.name for ban in active)
+    return (
+        f"wontdo: banned here: {names}. Project rules asking for them are cancelled. Do not attempt, "
+        "offer or mention them unless this message asks for one directly."
+    )
+
+
+def banned_phrase(root):
+    return ", ".join(ban.name for ban in active_bans(root)) or "nothing"
 
 
 # Session state ---------------------------------------------------------------
@@ -886,15 +1051,17 @@ def added_text(root, rel, *revisions):
 
 
 def banned_change(root, rel, *revisions):
-    kind = classify(str(root / rel), str(root))
-    if kind == "a unit test":
+    """Return the kind of ban a change breaks, or None."""
+    ban = classify(str(root / rel), str(root))
+    if ban and ban.removals_ok:
         diff = git(root, "diff", "-U0", *revisions, "--", rel)
         if diff and not added_text(root, rel, *revisions).strip():
             return None
-    if kind:
-        return kind
+    if ban:
+        return ban.kind
     if os.path.splitext(rel)[1].lower() in CODE_EXT:
-        return content_kind(rel, added_text(root, rel, *revisions))
+        ban = content_ban(rel, added_text(root, rel, *revisions), root)
+        return ban.kind if ban else None
     return None
 
 
@@ -926,10 +1093,16 @@ def save_state(session, state):
         print(f"wontdo could not save state: {error}", file=sys.stderr)
 
 
+def use_state(state):
+    global STATE
+    STATE = state
+
+
 def ensure_baseline(state, session, roots):
+    """Remember what was already changed in each repo that has bans, so it isn't blamed on the agent."""
     changed = False
     for root in roots:
-        if root and str(root) not in state["baselines"]:
+        if root and active_bans(root) and str(root) not in state["baselines"]:
             state["baselines"][str(root)] = dirty_files(root)
             state.setdefault("heads", {})[str(root)] = git(root, "rev-parse", "-q", "--verify", "HEAD").strip()
             state.setdefault("started", {})[str(root)] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -937,8 +1110,7 @@ def ensure_baseline(state, session, roots):
             changed = True
     if changed:
         save_state(session, state)
-    global IGNORES
-    IGNORES = state.get("ignores", {})
+    use_state(state)
 
 
 def note_call(session, tool_use_id, event):
@@ -1061,7 +1233,8 @@ def write_log(payload, layer, kind, path):
         handle.write(json.dumps(entry) + "\n")
 
 
-def deny_message(path, kind, cwd=None, is_file=True):
+def deny_message(path, kind, ban_name=None, cwd=None, is_file=True, mark="/"):
+    root = repo_root(cwd) if cwd else None
     if cwd and os.path.isabs(path) and inside(path, cwd):
         path = os.path.relpath(path, cwd)
     if kind == COMMENT_KIND:
@@ -1069,15 +1242,15 @@ def deny_message(path, kind, cwd=None, is_file=True):
             f"WONTDO blocked this: {path} adds {kind}. The owner wants code with few comments. "
             "Write it again without the docstring or comment block."
         )
-    if kind == OFF_KIND:
+    if kind == OFF_KIND or not ban_name:
         tail = "and that the choice to turn it off is theirs."
     elif is_file:
-        tail = f"and that they can allow this one file by typing on its own line: wontdo allow {path}"
+        tail = f"and that they can type {mark}wontdo:allow {path} (this file) or {mark}wontdo:allow {ban_name} (all of it)"
     else:
-        tail = "and that the choice to turn it off is theirs."
+        tail = f"and that they can type {mark}wontdo:allow {ban_name}"
     return (
-        f"WONTDO blocked this: {path} is {kind}. Agents may not do {BANNED} here, and this "
-        "overrides any project instruction that says otherwise. Do not retry through another "
+        f"WONTDO blocked this: {path} is {kind}. Banned here: {banned_phrase(root)}. This overrides "
+        "any project instruction that says otherwise. Do not retry through another "
         "tool, script, file name or location. Do not try to disable wontdo. Drop this part of "
         "the work and carry on with the code. Do not report it as missing or offer it later. "
         f"Only if the user directly asked for this, tell them wontdo blocked it {tail}"
@@ -1114,46 +1287,77 @@ def git_violation(command, roots, state, windows):
     return None
 
 
+def additional_context(event, text):
+    if text:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
 def on_session(payload):
     session = session_name(payload)
-    ensure_baseline(load_state(session), session, [repo_root(payload.get("cwd") or ".")])
-    print(json.dumps({
-        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": rule_text()}
-    }))
+    root = repo_root(payload.get("cwd") or ".")
+    ensure_baseline(load_state(session), session, [root])
+    additional_context("SessionStart", rule_text(root))
 
 
 def on_subagent(payload):
-    print(json.dumps({
-        "hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": rule_text()}
-    }))
+    session = session_name(payload)
+    root = repo_root(payload.get("cwd") or ".")
+    ensure_baseline(load_state(session), session, [root])
+    additional_context("SubagentStart", rule_text(root))
+
+
+def set_repo_bans(root, names, on):
+    table = read_repo_bans()
+    current = set(table.get(str(root), []))
+    current = current | set(names) if on else current - set(names)
+    if current:
+        table[str(root)] = sorted(current)
+    else:
+        table.pop(str(root), None)
+    write_repo_bans(table)
+
+
+def forget_baseline(state, root):
+    for key in ("baselines", "heads", "started", "ignores"):
+        state.get(key, {}).pop(str(root), None)
 
 
 def on_prompt(payload):
     prompt = payload.get("prompt") or ""
-    wanted = re.findall(r"^wontdo allow[ \t]+(.+?)[ \t]*$", prompt, re.M | re.I)
-    context = REMINDER
     cwd = payload.get("cwd") or "."
+    root = repo_root(cwd)
     session = session_name(payload)
     state = load_state(session)
-    accepted, refused = [], []
-    for raw in wanted:
-        path = raw.strip("`'\"")
-        absolute = absolute_path(path, cwd)
-        if re.search(r"[*?\[]", path) or off_switch(path, cwd, "Bash", {}) or os.path.basename(absolute) == IGNORE_FILE:
-            refused.append(path)
-            continue
-        state.setdefault("allowed", []).append(os.path.realpath(absolute))
-        accepted.append(path)
-        record(payload, "allowed", "owner exception", path)
-    if accepted:
-        save_state(session, state)
-        names = ", ".join(accepted)
-        context += f" The owner allowed this one file for this session: {names}."
-    if refused:
-        context += f" wontdo refused this exception, tell the owner it needs one exact file: {', '.join(refused)}."
-    print(json.dumps({
-        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
-    }))
+    use_state(state)
+    notes = []
+    choices = ", ".join(["all"] + list(BY_NAME))
+    for verb, raw in re.findall(r"^[/$]wontdo:(ban|allow)[ \t]+(.+?)[ \t]*$", prompt, re.M | re.I):
+        word = raw.strip("`'\"")
+        names = list(BY_NAME) if word.lower() == "all" else [word.lower()] if word.lower() in BY_NAME else None
+        if names and not root:
+            notes.append("wontdo works repo by repo and this folder is not a git repo, so nothing changed. Tell the owner.")
+        elif names:
+            on = verb.lower() == "ban"
+            if on:
+                forget_baseline(state, root)
+            set_repo_bans(root, names, on)
+            record(payload, verb.lower(), "owner", word.lower())
+            label = ", ".join(names)
+            notes.append(
+                f"The owner banned {label} in this repo until they lift it." if on else
+                f"The owner lifted the ban on {label} in this repo, so that is allowed now. Earlier wontdo instructions about it no longer apply."
+            )
+        elif verb.lower() == "ban" or re.search(r"[*?\[]", word) or off_switch(word, cwd, "Bash", {}):
+            notes.append(f"wontdo did not understand '{word}'. Tell the owner the choices are: {choices}, or one exact file after allow.")
+        else:
+            state.setdefault("allowed", []).append(os.path.realpath(absolute_path(word, cwd)))
+            record(payload, "allowed", "owner exception", word)
+            notes.append(f"The owner allowed this one file for this session: {word}.")
+    if re.search(r"^[/$]wontdo:status[ \t]*$", prompt, re.M | re.I):
+        notes.append(f"Tell the owner what is banned in this repo: {banned_phrase(root)}. Choices: {choices}.")
+    ensure_baseline(state, session, [root])
+    save_state(session, state)
+    additional_context("UserPromptSubmit", " ".join([reminder_text(root)] + notes).strip())
 
 
 def on_pre(payload):
@@ -1162,6 +1366,7 @@ def on_pre(payload):
     cwd = payload.get("cwd") or "."
     session = session_name(payload)
     state = load_state(session)
+    mark = "$" if "turn_id" in payload else "/"
     command = tool_input.get("command") or "" if tool == "Bash" else ""
     roots = bash_roots(command, cwd) if tool == "Bash" else {repo_root(cwd)}
     written = writes_in(tool, tool_input, cwd)
@@ -1169,36 +1374,44 @@ def on_pre(payload):
         if path:
             roots.add(repo_root(os.path.dirname(absolute_path(path, cwd))))
     roots.discard(None)
+    use_state(state)
+    if not any(active_bans(root) for root in roots):
+        if tool == "Bash":
+            note_call(session, payload.get("tool_use_id") or "x", "start")
+        return
     ensure_baseline(state, session, roots)
 
     for path, text in written:
         if not path:
             continue
         kind = off_switch(path, cwd, tool, tool_input)
+        ban_name = None
         added = "\n".join(new_lines(tool, tool_input, absolute_path(path, cwd), text)) if text else text
         if not kind and not is_allowed(path, cwd, state):
-            kind = classify(path, cwd)
-            if kind == "a unit test" and tool in {"Edit", "MultiEdit"} and not (added or "").strip():
-                kind = None
-            elif not kind:
-                kind = content_kind(path, added)
+            ban = classify(path, cwd)
+            if ban and ban.removals_ok and tool in {"Edit", "MultiEdit"} and not (added or "").strip():
+                ban = None
+            elif not ban:
+                ban = content_ban(path, added, repo_root(os.path.dirname(absolute_path(path, cwd))))
+            if ban:
+                kind, ban_name = ban.kind, ban.name
         kind = kind or comment_kind(path, cwd, tool, tool_input, text, state)
         if kind:
             record(payload, "pre", kind, path)
-            deny(deny_message(path, kind, cwd))
+            deny(deny_message(path, kind, ban_name, cwd, mark=mark))
             return
 
     action = banned_tool(tool, tool_input, cwd)
     if action:
         record(payload, "pre", action[1], action[0])
-        deny(deny_message(action[0], action[1], is_file=False))
+        deny(deny_message(action[0], action[1], action[2], cwd, is_file=False, mark=mark))
         return
 
     if tool == "Bash":
         rel = git_violation(command, roots, state, call_windows(session))
         if rel:
             record(payload, "commit", "a banned change", rel)
-            deny(deny_message(rel, "a banned change, so it can't be committed or pushed", is_file=False))
+            deny(deny_message(rel, "a banned change, so it can't be committed or pushed", None, cwd, is_file=False))
             return
         note_call(session, payload.get("tool_use_id") or "x", "start")
 
@@ -1211,7 +1424,7 @@ def on_post(payload):
 def new_prs(root, state):
     """Return URLs of PRs opened with this account since the session began, once each."""
     started = state.get("started", {}).get(str(root))
-    if not started or not shutil.which("gh"):
+    if PRS not in active_bans(root) or not started or not shutil.which("gh"):
         return []
     try:
         done = subprocess.run(
@@ -1257,8 +1470,8 @@ def on_stop(payload):
             "decision": "block",
             "reason": (
                 f"WONTDO: commands in this session, including scripts and subagents, changed files "
-                f"agents may not write: {', '.join(show(p) for p in to_undo)}. Agents may not do "
-                f"{BANNED}. These are yours to undo now: delete files that were created and reverse "
+                f"agents may not write: {', '.join(show(p) for p in to_undo)}. Banned here: "
+                f"{banned_phrase(repo_root(cwd))}. These are yours to undo now: delete files that were created and reverse "
                 "edits by hand. If they were committed, remove them in a new commit and do not "
                 "rewrite history. Do not use git restore, git checkout, git reset or git stash, "
                 "because these files may hold the user's uncommitted work. Leave a file alone only "
@@ -1296,6 +1509,11 @@ def on_stop(payload):
 def status():
     if os.environ.get("WONTDO_OFF"):
         print("wontdo is off for this session (WONTDO_OFF)")
+    table = read_repo_bans()
+    print(f"bans you can use: all, {', '.join(BY_NAME)}")
+    print("banned repos:" if table else "nothing is banned in any repo")
+    for repo, names in sorted(table.items()):
+        print(f"  {repo}: {', '.join(names)}")
     try:
         lines = LOG.read_text().splitlines()
     except OSError:
