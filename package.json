@@ -1,5 +1,5 @@
 {
-  "name": "wontdo",
+  "name": "@khalidsaidi/wontdo",
   "version": "0.6.1",
   "description": "Ban what agents do, repo by repo: docs, tests, CI and PRs. Installs the wontdo plugin in Claude Code and Codex.",
   "bin": {
@@ -23,5 +23,8 @@
   "license": "MIT",
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
