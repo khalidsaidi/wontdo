@@ -395,6 +395,20 @@ SCRIPT_PR = re.compile(
 SCRIPT_CI = re.compile(
     r"\bgh\s+workflow\s+(run|enable)\b|\bgh\s+run\s+rerun\b|\bglab\s+ci\s+(run|retry|trigger)\b"
 )
+SCRIPT_BRANCH = re.compile(
+    r"\bgit\s+(checkout\s+(-\S+\s+)*-(b|B|-orphan)\b|switch\s+(-\S+\s+)*-(c|C|-create|-force-create|-orphan)\b"
+    r"|branch\s+(-\S+\s+)*-(d|D|m|M|c|C|-delete|-move|-copy)\b|worktree\s+add\s+(-\S+\s+)*-(b|B)\b"
+    r"|push\s+(\S+\s+)*--delete\b|update-ref\s+(-\S+\s+)*refs/heads/)"
+    r"|['\"]git['\"]\s*,\s*['\"](checkout|switch)['\"]\s*,\s*['\"]-(b|B|c|C)['\"]"
+)
+GIT_VALUE_FLAGS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+BRANCH_CHANGE_FLAGS = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy"}
+BRANCH_READ_FLAGS = {
+    "-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current",
+    "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort",
+    "-u", "--set-upstream-to", "--unset-upstream", "--edit-description", "--column", "--no-column",
+}
+BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--format", "--sort", "-u", "--set-upstream-to", "--column"}
 SHELLS = {"bash", "sh", "zsh", "dash"}
 INTERPRETERS = SHELLS | {"python", "python3", "node", "ruby", "perl", "deno", "bun", "tsx", "ts-node", "source", "."}
 HEREDOC_START = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
@@ -756,6 +770,11 @@ def banned_tool(tool, tool_input, cwd):
             for ban in active_bans(repo_root(cwd)):
                 if ban.mcp(name):
                     return name, ban.kind, ban.name
+        return None
+    for ban in active_bans(repo_root(cwd)):
+        hit = ban.tool(tool, tool_input)
+        if hit:
+            return hit, ban.kind, ban.name
     return None
 
 
@@ -820,6 +839,9 @@ class Ban:
 
     def mcp(self, name):
         return False
+
+    def tool(self, tool, tool_input):
+        return None
 
 
 class Docs(Ban):
@@ -917,6 +939,76 @@ class Prs(Ban):
         return bool(re.search(r"pull_?request|merge_?request|_pr\b|^create_pr|pending_review|request_copilot_review", name, re.I))
 
 
+def git_subcommand(args):
+    """Return (subcommand, its args) for git, skipping git's own options such as -C <dir>."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in GIT_VALUE_FLAGS else 1
+    return (args[i], args[i + 1:]) if i < len(args) else ("", [])
+
+
+def split_flags(args, value_flags):
+    """Return (flags, positionals), skipping the value after each flag in value_flags."""
+    flags, positionals, skip = set(), [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--":
+            continue
+        elif arg.startswith("-"):
+            flag = arg.split("=", 1)[0]
+            flags.add(flag)
+            skip = flag in value_flags and "=" not in arg
+        else:
+            positionals.append(arg)
+    return flags, positionals
+
+
+class Branches(Ban):
+    name, kind = "branches", "a branch change"
+    rule = "create, rename or delete git branches, or start worktrees on new branches (stay on the current branch)"
+    API_TAIL = r"(/git/refs\b|/branches/[^\s'\"]+/rename\b)"
+
+    def command(self, s):
+        if s.cmd == "git":
+            sub, rest = git_subcommand(s.args)
+            if sub == "branch":
+                flags, names = split_flags(rest, BRANCH_VALUE_FLAGS)
+                if flags & BRANCH_CHANGE_FLAGS or (names and not flags & BRANCH_READ_FLAGS):
+                    return "git branch " + " ".join(rest)
+            if sub == "checkout" and {"-b", "-B", "--orphan"} & split_flags(rest, set())[0]:
+                return "git checkout " + " ".join(rest)
+            if sub == "switch" and {"-c", "-C", "--create", "--force-create", "--orphan"} & split_flags(rest, set())[0]:
+                return "git switch " + " ".join(rest)
+            if sub == "worktree" and rest[:1] == ["add"]:
+                flags, paths = split_flags(rest[1:], {"-b", "-B", "--orphan", "--reason"})
+                if flags & {"-b", "-B", "--orphan"} or (len(paths) == 1 and not flags & {"-d", "--detach"}):
+                    return "git worktree " + " ".join(rest)
+            if sub == "push":
+                flags, refs = split_flags(rest, {"-o", "--push-option", "--repo", "--receive-pack", "--exec"})
+                if flags & {"-d", "--delete"} or any(r.startswith(":") and len(r) > 1 for r in refs):
+                    return "git push " + " ".join(rest)
+            if sub == "update-ref" and any(a.startswith("refs/heads/") for a in rest):
+                return "git update-ref " + " ".join(rest)
+            return None
+        return f"{s.cmd} write to a branch endpoint" if is_api_write(s, self.API_TAIL) else None
+
+    def script(self, line, nearby):
+        if SCRIPT_BRANCH.search(line):
+            return True
+        return bool(re.search(API_HOST + self.API_TAIL, line) and POST_WORD.search(nearby))
+
+    def mcp(self, name):
+        return bool(re.search(r"branch|_ref\b|create_ref", name, re.I))
+
+    def tool(self, tool, tool_input):
+        if tool == "EnterWorktree" and not tool_input.get("path"):
+            return "EnterWorktree (it starts a new branch)"
+        if tool == "Agent" and tool_input.get("isolation") == "worktree":
+            return "an agent in its own worktree (it starts a new branch)"
+        return None
+
+
 class ListedBan(Ban):
     """A ban declared as one entry in bans.json."""
 
@@ -946,8 +1038,8 @@ def load_listed_bans():
         return []
 
 
-CI, TESTS, DOCS, PRS = Ci(), Tests(), Docs(), Prs()
-BANS = [CI, TESTS, DOCS, PRS] + load_listed_bans()
+CI, TESTS, DOCS, PRS, BRANCHES = Ci(), Tests(), Docs(), Prs(), Branches()
+BANS = [CI, TESTS, DOCS, PRS, BRANCHES] + load_listed_bans()
 BY_NAME = {ban.name: ban for ban in BANS}
 
 CONFIG = Ban()

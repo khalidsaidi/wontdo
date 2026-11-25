@@ -2,7 +2,7 @@
 
 Ban what agents do, repo by repo.
 
-wontdo is a plugin for Claude Code and Codex. You tell it what agents may not do in a repo: write docs, write unit tests, touch CI, or open pull requests. Its hooks then block those actions before they run. Nothing is banned until you say so.
+wontdo is a plugin for Claude Code and Codex. You tell it what agents may not do in a repo: write docs, write unit tests, touch CI, open pull requests, or make branches. Its hooks then block those actions before they run. Nothing is banned until you say so.
 
 ## Install
 
@@ -38,6 +38,7 @@ In Claude Code type these as `/wontdo:...`, in Codex as `$wontdo:...`.
 - `tests`: unit tests, such as test files and in-source tests. Deleting existing tests when asked is still allowed.
 - `ci`: CI config, and triggering CI runs (`gh workflow run`, `gh run rerun`, the CI APIs).
 - `prs`: opening or changing pull requests, through `gh`, `glab`, `hub`, the APIs or MCP tools.
+- `branches`: creating, renaming or deleting branches (`git branch`, `checkout -b`, `switch -c`, `push --delete`, the APIs or MCP tools), and starting worktrees on new branches, including Claude Code's `EnterWorktree` and worktree agents. Listing branches, switching to existing ones and pushing are still allowed.
 
 Bans belong to the repo, not the agent, so Claude Code and Codex share them.
 

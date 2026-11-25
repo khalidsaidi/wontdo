@@ -1,7 +1,7 @@
 {
   "name": "@khalidsaidi/wontdo",
-  "version": "0.6.2",
-  "description": "Ban what agents do, repo by repo: docs, tests, CI and PRs. Installs the wontdo plugin in Claude Code and Codex.",
+  "version": "0.7.0",
+  "description": "Ban what agents do, repo by repo: docs, tests, CI, PRs and branches. Installs the wontdo plugin in Claude Code and Codex.",
   "bin": {
     "wontdo": "install.js"
   },

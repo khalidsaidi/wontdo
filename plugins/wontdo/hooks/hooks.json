@@ -23,7 +23,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*(move|write|edit|create).*|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow|mcp__.*(_pr\\b|pending_review|copilot_review)",
+        "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|apply_patch|mcp__.*(write|edit|create|move).*file|mcp__.*(move|write|edit|create).*|mcp__.*([Pp]ull|[Mm]erge).*[Rr]equest|mcp__.*[Ww]orkflow|mcp__.*(_pr\\b|pending_review|copilot_review)|mcp__.*([Bb]ranch|_ref\\b)|^EnterWorktree$|^Agent$",
         "hooks": [
           { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/wontdo.py\" pre", "timeout": 30, "onFailure": "block" }
         ]

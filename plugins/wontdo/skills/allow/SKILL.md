@@ -1,7 +1,7 @@
 ---
 name: allow
-description: Lift a ban in this repo (all, docs, tests, ci, prs), or allow one exact file for this session. Only the owner can run this.
-argument-hint: <all|docs|tests|ci|prs|file>
+description: Lift a ban in this repo (all, docs, tests, ci, prs, branches), or allow one exact file for this session. Only the owner can run this.
+argument-hint: <all|docs|tests|ci|prs|branches|file>
 disable-model-invocation: true
 ---
 
